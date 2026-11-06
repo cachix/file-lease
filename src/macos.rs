@@ -78,6 +78,13 @@ fn command(program: &str, args: &[&std::ffi::OsStr]) -> io::Result<()> {
 }
 
 fn command_until(program: &str, args: &[&std::ffi::OsStr], deadline: Instant) -> io::Result<()> {
+    let _span = super::profiling::Span::new(match program {
+        "/sbin/newfs_hfs" => "tool.format",
+        "/sbin/mount" => "tool.mount",
+        "/sbin/umount" => "tool.unmount",
+        "/usr/bin/hdiutil" => "tool.detach",
+        _ => "tool.other",
+    });
     // Volume tools operate only on metadata. Avoid pipe-draining threads which
     // could themselves wait forever if a tool leaves descendants holding pipes.
     super::command::run_until(
@@ -189,12 +196,17 @@ impl Journal {
     }
 
     fn save(&self, directory: &Path) -> io::Result<()> {
+        let _span = super::profiling::Span::new("journal.save");
         // Keep the previous complete record if a writer dies during an update.
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         serde_json::to_writer(&mut file, self).map_err(io::Error::other)?;
-        file.as_file().sync_all()?;
+        {
+            let _span = super::profiling::Span::new("journal.file_sync");
+            file.as_file().sync_all()?;
+        }
         file.persist(directory.join("lease.json"))
             .map_err(|error| error.error)?;
+        let _span = super::profiling::Span::new("journal.directory_sync");
         fs::File::open(directory)?.sync_all()
     }
 
@@ -203,6 +215,7 @@ impl Journal {
     }
 
     fn mounted_root(&self) -> io::Result<Option<(fs::File, libc::statfs)>> {
+        let _span = super::profiling::Span::new("mount.inspect");
         if !self.device.strip_prefix("/dev/disk").is_some_and(|digits| {
             !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
         }) {
@@ -238,6 +251,7 @@ impl Journal {
     }
 
     fn validate_device(&self) -> io::Result<bool> {
+        let _span = super::profiling::Span::new("device.validate");
         if self.device.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -313,6 +327,7 @@ impl Journal {
 /// Recover only journals belonging to dead keepers, comparing process birth
 /// times and the mounted filesystem identity before removing any resource.
 fn recover_orphans(root: &Path) -> io::Result<()> {
+    let _span = super::profiling::Span::new("recovery.scan");
     recover_orphans_until(root, Instant::now() + RECOVERY_TIMEOUT)
 }
 
@@ -536,6 +551,7 @@ fn setup_and_guard(directory: &Path) -> io::Result<()> {
     // recovery may remove the directory, so the guardian must not create any
     // further metadata files there.
     let signal = (|| -> io::Result<()> {
+        let _span = super::profiling::Span::new("guardian.ready_publish");
         let mut ready = tempfile::NamedTempFile::new_in(directory)?;
         write!(
             ready,
@@ -578,6 +594,7 @@ fn setup_and_guard(directory: &Path) -> io::Result<()> {
 }
 
 fn setup_device(directory: &Path) -> io::Result<()> {
+    let _span = super::profiling::Span::new("setup.device");
     let mut journal = Journal::read(directory)?;
     // stdout holds the inherited lock throughout setup. The guardian closes
     // it after setup, before monitoring the keeper and competing for cleanup.
@@ -604,6 +621,8 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     // worker while attachment is running. The tool retains the setup lock.
     journal.attachment_started = Some(true);
     journal.save(directory)?;
+    #[cfg(feature = "profiling")]
+    let attach_span = super::profiling::Span::new("tool.attach");
     let attach = match attach.process_group(0).spawn() {
         Ok(attach) => attach,
         Err(error) => {
@@ -618,6 +637,8 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     }
     super::command::wait(attach, TOOL_TIMEOUT)
         .map_err(|error| io::Error::new(error.kind(), format!("hdiutil attach: {error}")))?;
+    #[cfg(feature = "profiling")]
+    drop(attach_span);
     match registry::device(id)? {
         Some(device) => {
             journal.device_identity = Some(device_identity(&fs::metadata(&device)?));
@@ -722,6 +743,7 @@ impl Volume {
     /// check followed by a path-based write could reach the disk-backed mount
     /// directory if the RAM volume were unmounted between those operations.
     fn open_root(&self) -> io::Result<fs::File> {
+        let _span = super::profiling::Span::new("root.validate");
         let (root, info) = self
             .journal
             .mounted_root()?
@@ -743,6 +765,7 @@ impl Volume {
     }
 
     fn create() -> io::Result<Self> {
+        let _span = super::profiling::Span::new("volume.create");
         let root = runtime_root()?;
         recover_orphans(&root)?;
         Self::create_in(&root)
@@ -774,6 +797,7 @@ impl Volume {
         // After attachment can start, metadata must survive every error path.
         let directory = directory.keep();
         let setup = (|| -> io::Result<Journal> {
+            let _span = super::profiling::Span::new("guardian.wait_ready");
             let mut worker = Command::new(std::env::current_exe()?);
             worker
                 .env(SETUP_ENV, &directory)
@@ -829,11 +853,13 @@ pub(super) struct Storage {
 }
 impl Storage {
     pub(super) fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
+        let _span = super::profiling::Span::new("storage.allocate");
         if self.volume.is_none() {
             self.volume = Some(Volume::create()?);
         }
         let volume = self.volume.as_ref().unwrap();
         let root = volume.open_root()?;
+        let _span = super::profiling::Span::new("file.write");
         self.counter = self
             .counter
             .checked_add(1)
@@ -889,6 +915,7 @@ impl Storage {
     }
     pub(super) fn cleanup(&mut self) -> io::Result<()> {
         if let Some(volume) = self.volume.take() {
+            let _span = super::profiling::Span::new("storage.cleanup");
             // Failed cleanup stays journaled. The guardian retries after this
             // keeper exits, and later leases remain a fallback if both die.
             cleanup_with_retry(&volume.directory)?;

@@ -8,6 +8,10 @@ repository = "https://github.com/cachix/file-lease"
 description = "Process-owned memory-backed files with automatic cleanup"
 readme = "README.md"
 
+[features]
+# Internal diagnostics for synthetic benchmarks; disabled in ordinary builds.
+profiling = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }

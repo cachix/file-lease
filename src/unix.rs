@@ -60,6 +60,7 @@ impl Keeper {
     }
 
     pub(super) fn spawn(owner: u32, executable: Option<&Path>) -> io::Result<Self> {
+        let _span = super::profiling::Span::new("lease.helper_spawn");
         valid_pid(owner)?;
         #[cfg(target_os = "macos")]
         let owner_info = super::macos::process_info(owner)?;
@@ -152,6 +153,7 @@ impl Keeper {
     }
 
     pub(super) fn materialize(&self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
+        let _span = super::profiling::Span::new("lease.allocate");
         if bytes.len() as u64 > MAX_SECRET_BYTES {
             return Err(io::Error::other("Secret exceeds file lease size limit"));
         }
@@ -249,6 +251,7 @@ impl Keeper {
 
 impl Drop for Keeper {
     fn drop(&mut self) {
+        let _span = super::profiling::Span::new("lease.cleanup");
         if let Ok(child) = self.child.get_mut()
             && let Some(mut child) = child.take()
         {

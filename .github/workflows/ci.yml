@@ -32,9 +32,32 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint all targets
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test leases, crash recovery, deadlines, and volume exhaustion
         # macOS tests exercise real RAM volumes and interrupted recovery.
-        run: cargo test --locked -- --test-threads=1
-      - name: Measure small-file setup and cleanup latency
-        run: cargo run --locked --example lifecycle_timings
+        run: cargo test --locked --all-features -- --test-threads=1
+      - name: Measure release latency and internal phases
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/file-lease-benchmark"
+          mkdir -p "$results/phases"
+          chmod 700 "$results" "$results/phases"
+          uname -a | tee "$results/host.txt"
+          rustc --version | tee -a "$results/host.txt"
+          cargo run --locked --release --example lifecycle_timings | tee "$results/release.csv"
+          _FILE_LEASE_PROFILE_DIR="$results/phases" cargo run --locked --release --features profiling --example lifecycle_timings | tee "$results/profiled.csv"
+          python3 scripts/summarize_timings.py "$results" | tee "$results/summary.csv"
+          {
+            echo '### Release latency and nested phase timings (milliseconds)'
+            echo 'Phase spans nest and must not be added together. Profiling adds diagnostic IO.'
+            echo '```csv'
+            cat "$results/summary.csv"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: lifecycle-timings-${{ matrix.runner }}
+          path: ${{ runner.temp }}/file-lease-benchmark/
+          if-no-files-found: warn

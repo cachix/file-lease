@@ -90,6 +90,7 @@ fn check(result: i32) -> io::Result<()> {
 }
 
 pub(super) fn device(id: uuid::Uuid) -> io::Result<Option<String>> {
+    let _span = super::profiling::Span::new("registry.lookup");
     retry_lookup(|| device_once(id))
 }
 

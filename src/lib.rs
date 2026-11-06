@@ -17,6 +17,8 @@ mod macos_registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "unix.rs"]
 mod platform;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod profiling;
 
 /// A cloneable lease on memory-backed files.
 ///
