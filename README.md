@@ -9,9 +9,7 @@ configuration file. The consumer opens the path normally; it needs no library
 integration or descriptor-passing protocol. A separate helper holds the storage
 and watches the process you select as its owner.
 
-This is currently an **unpublished standalone crate**, with an independent 0.1.0
-API. It does not depend on SecretSpec or perform secret resolution. SecretSpec
-uses it by default for secret-file delivery in version 0.22+.
+This is currently an **unpublished standalone crate**, with a 0.1.0 API.
 
 ## Quick start
 
@@ -136,9 +134,6 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-SecretSpec (0.22+) already hosts the helper, so its users need no additional
-executable or application hook.
-
 The helper wire protocol and recovery format are internal. Deploy matching
 library and helper versions. They are not a public interoperability contract.
 
@@ -151,63 +146,117 @@ library and helper versions. They are not a public interoperability contract.
 | [`memfd_path`](https://crates.io/crates/memfd_path) | An in-memory Linux file accessed through `/proc/self/fd/...`. | Paths hosted independently of the launcher, without requiring the consumer to inherit the file descriptor. |
 | [`shared_memory`](https://crates.io/crates/shared_memory), [`native-ipc`](https://crates.io/crates/native-ipc) | Sharing mappings between cooperating processes. | File paths that ordinary programs can open without shared-memory integration. |
 
-## Platform behavior and limits
+## How it works
 
-- Linux uses sealed, read-only memfds exposed as `/proc/<helper>/fd/<fd>`.
-  A shared read-only mapping is populated and locked with `mlock()` before
-  payload bytes are written. It stays locked while the helper retains that
-  file, and is excluded from ordinary process core dumps with `MADV_DONTDUMP`.
-  Empty files need no mapping. Allocation fails if locking fails, with no
-  pageable or disk-backed fallback. The helper inherits `RLIMIT_MEMLOCK`;
-  live nonempty files consume their sizes rounded up to whole pages. Configure
-  a sufficient memory-lock limit before launching the application. Releasing
-  a file reclaims its lock budget. See [`mlock(2)`](https://man7.org/linux/man-pages/man2/mlock.2.html).
-  The owner is watched through a pidfd. Suffix hints are accepted but omitted
-  from Linux paths. Consumers must open the proc-fd path directly. Software
-  that resolves it to the memfd's deleted backing name can reject it; PHP's
-  ordinary `fopen()` and `file_get_contents()` are affected. Check the actual
-  consumer before relying on this backend.
-  Descriptor numbers are not reused within a lease, so a revoked path cannot
-  expose a later file. Total allocations per lease are bounded by the helper's
-  file-descriptor limit; use a new lease for each resolution or refresh batch.
-  The helper's descriptors close even if it is killed. Independent open readers
-  can retain file contents after pathname revocation until they close them.
-- macOS uses a private 64 MiB HFS RAM disk with read-only files and a kqueue
-  process-exit watcher. Allocation and release pin the volume's directory and
-  verify its filesystem identity, ownership, private permissions, and
-  `noexec,nosuid,nodev,nobrowse` flags before accessing files. A missing or
-  replaced mount fails without writing into its disk-backed mount directory.
-  Normal cleanup unlinks files, unmounts, and detaches the
-  disk. The setup worker stays alive as a guardian in a separate process group
-  and cleans up if the helper is killed. Volume commands have 10-second
-  deadlines; failed cleanup is retried up to three times with backoff. If both
-  processes die, or cleanup keeps failing, a later lease retries recovery.
-  Recovery metadata, never payload bytes, lives in
-  `~/Library/Application Support/file-lease`. No background service is installed.
-  Startup recovery uses a shared five-second budget for scanning and volume-tool
-  waits, deferring remaining work to a later lease. Individual OS calls can still
-  take longer. Failures before attachment starts remove the unused metadata;
-  interrupted attachments and older journals retain conservative recovery rules.
-  Persistent cleanup failures are recorded in the lease directory's private
-  `cleanup.error` file, which contains only an error description and is removed
-  with the recovered lease. Detached helpers do not retain application output
-  pipes for diagnostics.
-- Other operating systems return `Unsupported` on allocation.
-- Payloads are limited to 64 MiB per request. The macOS limit also applies to
-  the whole volume, including filesystem overhead. Suffixes are limited to
-  80 ASCII letters, digits, dots, underscores, or hyphens.
-- The Linux lock covers only the helper's live file pages. Source buffers,
-  transport buffers, and consumer copies are not locked. Readers surviving
-  revocation can retain bytes after the helper unlocks them. macOS storage has
-  no additional memory-lock guarantee. Locking does not protect against
-  hibernation images or every diagnostic capture, and pathname revocation
-  cannot erase bytes already copied by a reader.
+The first allocation starts a helper and establishes a private control channel.
+The library sends the payload over that channel, and the helper creates the
+memory-backed file and returns its absolute path. The selected owner process
+and helper are separate: the helper can keep serving paths after the launcher
+exits, provided ownership has been handed off to a live process.
+
+### Linux
+
+Each payload gets its own anonymous file created with `memfd_create()`. The
+helper sizes the file, maps it read-only with `MAP_SHARED`, excludes the mapping
+from ordinary process core dumps with `MADV_DONTDUMP`, and calls `mlock()` to
+populate and lock its zero-filled pages **before writing the payload**. It then
+writes the bytes and seals the file against writes, growth, shrinkage, and
+changes to its seals. File permissions are `0400`.
+
+The returned path is `/proc/<helper-pid>/fd/<fd>`. A consumer opens that path
+normally without inheriting a descriptor. The helper holds the descriptor and
+locked mapping, and watches the selected owner through a pidfd. Releasing a file
+closes its descriptor and unmaps its pages; owner exit or lease cleanup releases
+all remaining files. Killing the helper also closes its descriptors and removes
+these paths.
+
+The helper inherits `RLIMIT_MEMLOCK`. Nonempty files consume their lengths
+rounded up to whole pages; empty files need no mapping. Allocation fails if
+locking fails, with no pageable or disk-backed fallback. Configure a sufficient
+memory-lock limit before launching the application. Releasing a file returns
+its lock budget. See [`mlock(2)`](https://man7.org/linux/man-pages/man2/mlock.2.html).
+
+Suffix hints are accepted but omitted from Linux paths. Consumers must open the
+proc-fd path directly. Programs that canonicalize it to the memfd's deleted
+backing name may reject it. For example, PHP's ordinary `fopen()` and
+`file_get_contents()` are affected. Check the actual consumer before relying on
+this backend. Access also depends on the consumer's ability to open the helper's
+proc-fd entries, including process visibility and permission restrictions.
+
+Descriptor numbers are never reused within a lease, so a revoked path cannot
+expose a later file. Total allocations per lease are bounded by the helper's
+file-descriptor limit. Use a new lease for each resolution or refresh batch.
+Existing open readers can retain contents after pathname revocation until they
+close their descriptors.
+
+### macOS
+
+The helper creates a private 64 MiB RAM disk, formats it as HFS, and mounts it
+using the system's `hdiutil`, `newfs_hfs`, and `mount` tools. The volume has
+ownership enabled and uses `noexec,nosuid,nodev,nobrowse` mount flags. Its root
+is private (`0700`), and payload files are read-only (`0400`). The returned path
+names an ordinary file on this volume and preserves the requested suffix.
+
+Before allocating or releasing a file, the helper pins the volume directory and
+verifies its filesystem identity, ownership, permissions, and mount flags.
+Directory-relative operations prevent a missing or replaced mount from
+redirecting payload writes or cleanup into the disk-backed mount directory.
+The owner is watched with `kqueue` process-exit notifications, with process birth
+time checks to avoid confusing a reused PID with the original owner.
+
+Normal cleanup unlinks the files, unmounts the volume, and detaches the RAM disk.
+The setup worker remains alive as a guardian in a separate process group and
+cleans up if the helper is killed. Volume commands have ten-second deadlines;
+failed cleanup is retried up to three times with backoff. If both processes die,
+or cleanup keeps failing, a later lease retries recovery. No background service
+is installed.
+
+Recovery journals contain metadata, never payload bytes, under
+`~/Library/Application Support/file-lease`. A unique lease identifier registered
+with the RAM disk allows recovery to identify an interrupted attachment before
+its device name was recorded. Recovery checks identities and conservatively
+preserves attachments it cannot identify safely. Failures before attachment
+starts remove unused metadata.
+
+Startup recovery shares a five-second budget across scanning and volume-tool
+waits, leaving unfinished work for a later lease. Individual OS calls can still
+take longer. Persistent cleanup failures are recorded in the lease directory's
+private `cleanup.error` file and removed with the recovered lease. Detached
+helpers do not retain application output pipes for diagnostics.
+
+The 64 MiB capacity includes filesystem overhead and all files in that lease.
+A full volume rejects new allocations and removes partial files while preserving
+existing payloads. The RAM-disk backend provides no additional memory-lock
+guarantee.
+
+### Other platforms
+
+Allocation currently returns `io::ErrorKind::Unsupported` on Windows and other
+operating systems. Windows shared-memory mappings are not ordinary file paths,
+and `FILE_ATTRIBUTE_TEMPORARY` does not prevent disk writes. Preserving this
+crate's path API and avoiding a disk-backed file requires a memory filesystem
+backend, such as one built on [WinFsp](https://github.com/winfsp/winfsp).
+See Microsoft's documentation on
+[named shared memory](https://learn.microsoft.com/en-us/windows/win32/memory/creating-named-shared-memory)
+and [temporary files](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+
+### Common limits
+
+Payloads are limited to 64 MiB per request. Suffixes are limited to 80 ASCII
+letters, digits, dots, underscores, or hyphens. Allocation failures never fall
+back to ordinary temporary files.
+
+The Linux lock covers only the helper's live file pages. Source buffers,
+transport buffers, and consumer copies are not locked. Readers surviving
+revocation can retain bytes after the helper unlocks them. Memory-backed storage
+does not protect against hibernation images or every diagnostic capture, and
+pathname revocation cannot erase bytes already copied by a reader.
 
 ## Development
 
 `cargo test --locked -- --test-threads=1` runs the storage, owner-exit,
 ownership-transfer, helper-crash, closed-descriptor, and macOS setup-recovery
-tests. CI runs these on Linux and macOS independently of SecretSpec tests.
+tests. CI runs these on native Linux and macOS hosts.
 
 `cargo run --locked --example lifecycle_timings` measures first-file setup,
 additional-file allocation, and cleanup latency with synthetic 256-byte files.
