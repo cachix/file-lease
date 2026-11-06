@@ -252,6 +252,35 @@ revocation can retain bytes after the helper unlocks them. Memory-backed storage
 does not protect against hibernation images or every diagnostic capture, and
 pathname revocation cannot erase bytes already copied by a reader.
 
+## Performance measurements
+
+A [native CI run on 2026-11-06](https://github.com/cachix/file-lease/actions/runs/42271739247)
+measured release builds on ARM64 runners with 256-byte payloads. Each sequential
+sample creates one lease and twenty additional files; ten leases give ten setup
+and cleanup measurements and 200 additional-file measurements.
+
+| Sequential operation, median | macOS 15 | macOS 26 |
+| --- | ---: | ---: |
+| First file, including setup | 209 ms | 290 ms |
+| Additional file | 0.36 ms | 0.59 ms |
+| Cleanup | 22 ms | 38 ms |
+
+The additional-file p95 was 0.49 ms and 1.99 ms respectively, but maxima reached
+42 ms and 44 ms. Instrumented measurements, pooled across ten sequential and four
+concurrent leases, located the long tail in closing the payload's write
+descriptor. Its p95 was about 39-40 ms, while payload writes took 4-8 microseconds
+median. [Apple's kernel source](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/vfs/vfs_vnops.c)
+flushes HFS files when their last writer closes, consistent with this behavior;
+these measurements do not include kernel stack traces proving the flush's cost.
+
+RAM-disk attachment was the largest individual setup phase. IOKit identity
+lookups took roughly 0.3-0.6 ms median, rather than causing the 40 ms spikes.
+These are diagnostic samples, not performance guarantees: runner load matters,
+and instrumented builds add IO overhead. Raw records and summaries are attached
+to the linked run. Retaining writers until release is a candidate for reducing
+allocation stalls, but would retain a descriptor per file and could move cost
+to cleanup; it has not yet been benchmarked.
+
 ## Development
 
 `cargo test --locked -- --test-threads=1` runs the storage, owner-exit,
