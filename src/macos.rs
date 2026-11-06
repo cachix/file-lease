@@ -870,26 +870,41 @@ impl Storage {
             .journal
             .mount
             .join(std::ffi::OsStr::from_bytes(name.as_bytes()));
-        let fd = unsafe {
-            libc::openat(
-                root.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600 as libc::c_uint,
-            )
+        let fd = {
+            let _span = super::profiling::Span::new("file.open");
+            unsafe {
+                libc::openat(
+                    root.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                )
+            }
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         let mut file = unsafe { fs::File::from_raw_fd(fd) };
-        if let Err(error) = file
-            .write_all(bytes)
-            .and_then(|_| file.set_permissions(fs::Permissions::from_mode(0o400)))
-        {
+        let write = {
+            let _span = super::profiling::Span::new("file.write_bytes");
+            file.write_all(bytes)
+        };
+        if let Err(error) = write.and_then(|_| {
+            let _span = super::profiling::Span::new("file.permissions");
+            file.set_permissions(fs::Permissions::from_mode(0o400))
+        }) {
             unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
             return Err(error);
         }
         self.files.insert(path.clone());
+        {
+            let _span = super::profiling::Span::new("file.close");
+            drop(file);
+        }
         Ok(path)
     }
     pub(super) fn release(&mut self, path: &Path) -> io::Result<()> {

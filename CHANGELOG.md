@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-- Add optional metadata-only phase profiling for file-lease latency diagnostics.
+- Add optional metadata-only phase profiling for file-lease latency diagnostics,
+  including individual macOS file operations.
 
 - Provide process-owned memory-backed files on Linux and macOS with automatic
   cleanup, owner handoff, and recovery of orphaned macOS RAM volumes.
