@@ -9,7 +9,7 @@ configuration file. The consumer opens the path normally; it needs no library
 integration or descriptor-passing protocol. A separate helper holds the storage
 and watches the process you select as its owner.
 
-This is currently an **unpublished workspace crate**, with an independent 0.1.0
+This is currently an **unpublished standalone crate**, with an independent 0.1.0
 API. It does not depend on SecretSpec or perform secret resolution. SecretSpec
 uses it by default for secret-file delivery in version 0.22+.
 
@@ -18,18 +18,20 @@ uses it by default for secret-file delivery in version 0.22+.
 Build and install the helper from a checkout of this repository:
 
 ```sh
-cargo install --path file-lease --locked
+git clone https://github.com/cachix/file-lease.git
+cd file-lease
+cargo install --path . --locked
 ```
 
 Deploy that matching `file-lease` executable alongside your application or on
 PATH. The helper handshake rejects older, incompatible versions before any
 payload is sent; upgrade the library and helper together.
 To use the library before publication, add a path dependency pointing to
-the `file-lease` directory in your checkout:
+your checkout:
 
 ```toml
 [dependencies]
-file-lease = { path = "../secretspec/file-lease" }
+file-lease = { path = "../file-lease" }
 ```
 
 This example gives `cat` a generated configuration file and keeps the lease
@@ -203,12 +205,18 @@ library and helper versions. They are not a public interoperability contract.
 
 ## Development
 
-`cargo test -p file-lease -- --test-threads=1` runs the storage, owner-exit,
+`cargo test --locked -- --test-threads=1` runs the storage, owner-exit,
 ownership-transfer, helper-crash, closed-descriptor, and macOS setup-recovery
 tests. CI runs these on Linux and macOS independently of SecretSpec tests.
 
-`cargo run -p file-lease --example lifecycle_timings` measures first-file setup,
+`cargo run --locked --example lifecycle_timings` measures first-file setup,
 additional-file allocation, and cleanup latency with synthetic 256-byte files.
 It reports five sequential leases and four parallel leases as CSV. The lifecycle
 CI matrix runs it on Linux and macOS. These are diagnostic timings, not performance
 thresholds or measurements of the RAM disk's memory footprint.
+
+CI runs the complete native test suite, including crash recovery and full RAM-volume
+regressions, on Linux, macOS 15, and macOS 26. Contributions should pass
+`cargo fmt --all -- --check` and `cargo clippy --locked --all-targets -- -D warnings`
+as well as the test command above. Changes assisted by AI should disclose that
+assistance in the pull request.

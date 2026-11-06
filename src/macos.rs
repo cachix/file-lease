@@ -113,7 +113,7 @@ fn c_string(bytes: &[libc::c_char]) -> &[u8] {
 
 fn runtime_root() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::other("Cannot locate SecretSpec file lease metadata"))?;
+        .ok_or_else(|| io::Error::other("Cannot locate file-lease metadata"))?;
     let root = PathBuf::from(home).join("Library/Application Support/file-lease");
     fs::DirBuilder::new()
         .recursive(true)
@@ -125,7 +125,7 @@ fn runtime_root() -> io::Result<PathBuf> {
         || metadata.mode() & 0o077 != 0
     {
         return Err(io::Error::other(
-            "SecretSpec file lease metadata directory must be private and user-owned",
+            "file-lease metadata directory must be private and user-owned",
         ));
     }
     root.canonicalize()
@@ -658,7 +658,7 @@ fn setup_device(directory: &Path) -> io::Result<()> {
             "-M".as_ref(),
             "700".as_ref(),
             "-v".as_ref(),
-            "SecretSpec".as_ref(),
+            "file-lease".as_ref(),
             device.as_ref(),
         ],
     )?;

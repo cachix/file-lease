@@ -1,14 +1,15 @@
 [package]
 name = "file-lease"
 version = "0.1.0"
-edition.workspace = true
+edition = "2024"
+rust-version = "1.92"
 license = "Apache-2.0"
-repository = "https://github.com/cachix/secretspec"
+repository = "https://github.com/cachix/file-lease"
 description = "Process-owned memory-backed files with automatic cleanup"
 readme = "README.md"
 
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+libc = "0.2"
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -16,16 +17,12 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-wait-timeout.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tempfile.workspace = true
-uuid.workspace = true
+wait-timeout = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.0"
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-tempfile.workspace = true
-wait-timeout.workspace = true
-
-# SecretSpec hosts the helper itself. Its release archives need no second binary.
-[package.metadata.dist]
-dist = false
+tempfile = "3.0"
+wait-timeout = "0.2"

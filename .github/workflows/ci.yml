@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    name: Storage and lifecycle (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test leases, crash recovery, deadlines, and volume exhaustion
+        # macOS tests exercise real RAM volumes and interrupted recovery.
+        run: cargo test --locked -- --test-threads=1
+      - name: Measure small-file setup and cleanup latency
+        run: cargo run --locked --example lifecycle_timings

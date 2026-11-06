@@ -392,7 +392,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                         stream.write_all(path.as_bytes())?;
                     }
                     Err(error) => {
-                        eprintln!("SecretSpec file storage: {error}");
+                        eprintln!("file-lease storage: {error}");
                         let message = error.to_string();
                         let message = if message.len() <= 16384 {
                             &message
