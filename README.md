@@ -277,9 +277,33 @@ RAM-disk attachment was the largest individual setup phase. IOKit identity
 lookups took roughly 0.3-0.6 ms median, rather than causing the 40 ms spikes.
 These are diagnostic samples, not performance guarantees: runner load matters,
 and instrumented builds add IO overhead. Raw records and summaries are attached
-to the linked run. Retaining writers until release is a candidate for reducing
-allocation stalls, but would retain a descriptor per file and could move cost
-to cleanup; it has not yet been benchmarked.
+to the linked run.
+
+### Retained-writer experiment
+
+An [A/B run on 2026-11-07](https://github.com/cachix/file-lease/actions/runs/42397249815)
+compared the current implementation with
+[`perf/macos-retained-writers`](https://github.com/cachix/file-lease/tree/perf/macos-retained-writers).
+Both versions used the same release-build harness on each runner, alternating
+order across three rounds. Each variant supplied 30 sequential leases with 600
+additional files, plus 12 concurrent leases with 240 additional files. Half the
+files were released individually; the remainder were revoked by dropping the
+lease. Values below are milliseconds, current implementation to retained writers.
+
+| Measurement | macOS 15 | macOS 26 |
+| --- | ---: | ---: |
+| Concurrent additional-file p95 | 41.66 → 4.14 | 43.01 → 4.57 |
+| Concurrent individual-release p95 | 2.57 → 42.39 | 1.91 → 43.96 |
+| Sequential cleanup median | 25.72 → 23.48 | 23.27 → 24.88 |
+| Sequential timed-lifecycle median | 288.69 → 253.62 | 263.56 → 272.79 |
+
+Timed lifecycle sums setup, all allocations, individual releases, and cleanup;
+it excludes verification reads. Retaining writers smooths allocation latency but
+moves stalls into explicit release, with no consistent overall improvement
+across these runners. It also retains a descriptor for every live file. The
+candidate passed all native tests, including descriptor cleanup, crash recovery,
+and volume exhaustion. It remains an experiment; the default implementation
+continues to close writers after allocation.
 
 ## Development
 
