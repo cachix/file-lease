@@ -849,7 +849,7 @@ impl Volume {
 pub(super) struct Storage {
     volume: Option<Volume>,
     counter: u64,
-    files: std::collections::HashSet<PathBuf>,
+    files: std::collections::HashMap<PathBuf, fs::File>,
 }
 impl Storage {
     pub(super) fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
@@ -900,15 +900,13 @@ impl Storage {
             unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
             return Err(error);
         }
-        self.files.insert(path.clone());
-        {
-            let _span = super::profiling::Span::new("file.close");
-            drop(file);
-        }
+        // HFS flushes on the final writer's close. Retain that descriptor
+        // until revocation so allocating a readable path does not wait on it.
+        self.files.insert(path.clone(), file);
         Ok(path)
     }
     pub(super) fn release(&mut self, path: &Path) -> io::Result<()> {
-        if !self.files.contains(path) {
+        if !self.files.contains_key(path) {
             return Err(io::Error::other("Path does not belong to this lease"));
         }
         let volume = self
@@ -925,12 +923,21 @@ impl Storage {
         if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.files.remove(path);
+        {
+            let _span = super::profiling::Span::new("file.release_close");
+            drop(self.files.remove(path));
+        }
         Ok(())
     }
     pub(super) fn cleanup(&mut self) -> io::Result<()> {
         if let Some(volume) = self.volume.take() {
             let _span = super::profiling::Span::new("storage.cleanup");
+            // Close writers before unmounting, even if volume cleanup fails.
+            // Explicit release unlinks first; bulk cleanup is measured separately.
+            {
+                let _span = super::profiling::Span::new("file.cleanup_close");
+                self.files.clear();
+            }
             // Failed cleanup stays journaled. The guardian retries after this
             // keeper exits, and later leases remain a fallback if both die.
             cleanup_with_retry(&volume.directory)?;
@@ -1009,7 +1016,7 @@ mod tests {
         let mut storage = Storage {
             volume: Some(Volume::create_in(root).unwrap()),
             counter: 0,
-            files: std::collections::HashSet::new(),
+            files: std::collections::HashMap::new(),
         };
         let path = storage.materialize(b"orphan-fixture", "").unwrap();
         let volume = storage.volume.as_mut().unwrap();
@@ -1098,6 +1105,36 @@ mod tests {
                 assert!(registry::device(orphan.id).unwrap().is_none());
             }
         }
+    }
+
+    #[test]
+    fn retained_writers_close_on_release_and_bulk_cleanup() {
+        use std::io::{Read, Seek};
+
+        let mut storage = Storage::default();
+        let first = storage.materialize(b"first-fixture", ".txt").unwrap();
+        let second = storage.materialize(b"second-fixture", "").unwrap();
+        let first_fd = storage.files[&first].as_raw_fd();
+        let second_fd = storage.files[&second].as_raw_fd();
+        assert_ne!(unsafe { libc::fcntl(first_fd, libc::F_GETFD) }, -1);
+        assert_eq!(fs::metadata(&first).unwrap().mode() & 0o777, 0o400);
+        assert_eq!(fs::read(&second).unwrap(), b"second-fixture");
+        let mut reader = fs::File::open(&first).unwrap();
+        storage.release(&first).unwrap();
+        assert!(!first.exists());
+        assert_eq!(unsafe { libc::fcntl(first_fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        let mut bytes = Vec::new();
+        reader.rewind().unwrap();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"first-fixture");
+        assert_ne!(unsafe { libc::fcntl(second_fd, libc::F_GETFD) }, -1);
+        drop(reader);
+        storage.cleanup().unwrap();
+        assert!(storage.files.is_empty());
+        assert!(!second.exists());
+        assert_eq!(unsafe { libc::fcntl(second_fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
     }
 
     #[test]

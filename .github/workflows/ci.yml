@@ -36,6 +36,35 @@ jobs:
       - name: Test leases, crash recovery, deadlines, and volume exhaustion
         # macOS tests exercise real RAM volumes and interrupted recovery.
         run: cargo test --locked --all-features -- --test-threads=1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: runner.os == 'macOS'
+        with:
+          persist-credentials: false
+          ref: 72d9dded6ab3c5eccc650868679a7ba07e6c85ee
+          path: baseline
+      - name: Compare eager close with retained writers on the same host
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/file-lease-benchmark"
+          mkdir -p "$results/ab"
+          chmod 700 "$results" "$results/ab"
+          # Compile the exact same harness against the unchanged baseline API.
+          cp examples/lifecycle_timings.rs baseline/examples/lifecycle_timings.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example lifecycle_timings
+          cargo build --locked --release --example lifecycle_timings
+          baseline_bin="$RUNNER_TEMP/file-lease-baseline-target/release/examples/lifecycle_timings"
+          retained_bin="$GITHUB_WORKSPACE/target/release/examples/lifecycle_timings"
+          for round in 0 1 2; do
+            # Alternate order to reduce systematic warm-cache and load bias.
+            variants="baseline retained"
+            if [[ "$round" == 1 ]]; then variants="retained baseline"; fi
+            for variant in $variants; do
+              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; else executable="$retained_bin"; fi
+              "$executable" --samples 10 --files 20 --parallel 4 > "$results/ab/$variant-$round.csv"
+            done
+          done
       - name: Measure release latency and internal phases
         shell: bash
         run: |

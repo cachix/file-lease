@@ -21,6 +21,16 @@ fn sample(files: usize) -> std::io::Result<Vec<(&'static str, f64)>> {
             return Err(io::Error::other("Incorrect synthetic file contents"));
         }
     }
+    // Release half individually and retain the rest for bulk cleanup. Both
+    // A/B implementations use this same harness, including verification.
+    for path in paths.iter().take(paths.len() / 2) {
+        let start = Instant::now();
+        lease.release(path)?;
+        timings.push(("release_file", start.elapsed().as_secs_f64() * 1000.0));
+        if path.exists() {
+            return Err(io::Error::other("Synthetic file survived explicit release"));
+        }
+    }
     let start = Instant::now();
     drop(lease);
     timings.push(("cleanup", start.elapsed().as_secs_f64() * 1000.0));

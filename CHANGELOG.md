@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Experiment with retaining macOS payload write descriptors until release to
+  defer HFS close-time flushes; each live file retains one descriptor.
+
 - Add optional metadata-only phase profiling for file-lease latency diagnostics,
   including individual macOS file operations.
 
