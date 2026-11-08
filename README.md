@@ -335,6 +335,29 @@ and its history; the default attachment behavior is unchanged. Reusing a lease
 amortizes volume creation today. Sharing a volume across independent leases
 would need a separate ownership and isolation design.
 
+## Shared-volume prototype
+
+The experimental `shared-volumes` feature shares one macOS RAM volume across
+independent leases created by the same process and matching helper executable.
+Each lease retains its own helper, process-exit watcher, and private inherited
+channel to the volume manager. Paths belong to one scope: another scope cannot
+release them. Dropping a lease revokes only its paths; handing it off keeps its
+helper and scope alive until its selected owner exits.
+
+The last scope and controller closing triggers volume teardown. There is no idle
+cache or installed service, so nonoverlapping leases still pay cold setup costs.
+The prototype shares a 64 MiB capacity budget and a volume-manager failure domain.
+A lease helper crash revokes only its scope; a manager crash revokes all scopes,
+with the guardian and existing orphan recovery handling volume cleanup. It is
+not enabled by default, and helpers must be built with the matching feature.
+Linux behavior is unchanged.
+
+`cargo run --locked --release --features shared-volumes --example
+shared_volume_timings` measures cold setup, sequential joins while an anchor lease
+remains live, concurrent joins, independent drops, and final teardown. CI compares
+this harness against a fixed unpooled baseline on macOS 26 and macOS 15, and
+records both durations and the number of distinct volumes created.
+
 ## Development
 
 `cargo test --locked -- --test-threads=1` runs the storage, owner-exit,

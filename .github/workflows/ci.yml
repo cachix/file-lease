@@ -36,6 +36,33 @@ jobs:
       - name: Test leases, crash recovery, deadlines, and volume exhaustion
         # macOS tests exercise real RAM volumes and interrupted recovery.
         run: cargo test --locked --all-features -- --test-threads=1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: runner.os == 'macOS'
+        with:
+          persist-credentials: false
+          ref: 05b802b15bc8daf136bb068bec992c60b15bf96b
+          path: baseline
+      - name: Compare overlapping independent leases
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/file-lease-benchmark"
+          mkdir -p "$results/ab"
+          chmod 700 "$results" "$results/ab"
+          cp examples/shared_volume_timings.rs baseline/examples/shared_volume_timings.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example shared_volume_timings
+          cargo build --locked --release --features shared-volumes --example shared_volume_timings
+          baseline_bin="$RUNNER_TEMP/file-lease-baseline-target/release/examples/shared_volume_timings"
+          pooled_bin="$GITHUB_WORKSPACE/target/release/examples/shared_volume_timings"
+          for round in 0 1 2; do
+            variants="baseline pooled"
+            if [[ "$round" == 1 ]]; then variants="pooled baseline"; fi
+            for variant in $variants; do
+              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; else executable="$pooled_bin"; fi
+              "$executable" --samples 10 --parallel 4 > "$results/ab/$variant-$round.csv"
+            done
+          done
       - name: Measure release latency and internal phases
         shell: bash
         run: |

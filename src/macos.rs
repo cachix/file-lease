@@ -1482,6 +1482,26 @@ mod tests {
         removed(&directory, id);
     }
 
+    #[cfg(feature = "shared-volumes")]
+    #[test]
+    fn dead_shared_manager_and_guardian_leave_recoverable_metadata() {
+        let pool = crate::volume_pool::Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let first = crate::FileLease::new(std::process::id());
+        let second = crate::FileLease::new(std::process::id());
+        let (one, directory, id, guardian) = lease_state(&first);
+        let two = second.materialize(b"second-pool-scope", None).unwrap();
+        assert_eq!(one.parent(), two.parent());
+        assert_eq!(unsafe { libc::kill(guardian as _, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::kill(pool.pid() as _, libc::SIGKILL) }, 0);
+        drop(first);
+        drop(second);
+        drop(pool);
+        recover_orphans(&runtime_root().unwrap()).unwrap();
+        removed(&directory, id);
+        assert!(!one.exists());
+        assert!(!two.exists());
+    }
+
     #[test]
     fn transient_cleanup_failures_are_retried() {
         let mut attempts = 0;

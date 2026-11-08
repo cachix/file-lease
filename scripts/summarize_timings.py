@@ -36,3 +36,26 @@ for path in sorted((root / "phases").glob("profile-*.csv")):
 if not groups:
     raise SystemExit("No phase measurements found")
 summarize(groups)
+
+# Pair each sample's timed operations, excluding verification reads. Keep rounds
+# grouped so all variants contribute equally, then pool their individual samples.
+groups = defaultdict(list)
+for path in sorted((root / "ab").glob("*.csv")):
+    variant = path.stem.split("-", 1)[0]
+    totals = defaultdict(float)
+    with path.open() as stream:
+        for row in csv.DictReader(stream):
+            value = float(row["elapsed_ms"])
+            groups[f"ab/{variant}/{row['mode']}/{row['operation']}"].append(value)
+            totals[(row["mode"], row["sample"])] += value
+    for (mode, sample), total in totals.items():
+        groups[f"ab/{variant}/{mode}/timed_lifecycle"].append(total)
+if groups:
+    summarize(groups)
+
+# Volume counts are counts of distinct mount directories, never milliseconds.
+for path in sorted((root / "ab").glob("*.csv")):
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    if rows and "volumes" in rows[0]:
+        print(f"# {path.name}: distinct_volumes={max(int(row['volumes']) for row in rows)}")

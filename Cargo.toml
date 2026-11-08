@@ -11,6 +11,8 @@ readme = "README.md"
 [features]
 # Internal diagnostics for synthetic benchmarks; disabled in ordinary builds.
 profiling = []
+# Experimental process-local sharing of macOS volumes across overlapping leases.
+shared-volumes = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
