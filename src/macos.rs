@@ -609,6 +609,8 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     attach
         .args([
             "attach",
+            // Avoid the persistent DiskImages helper when supported in-kernel.
+            "-kernel",
             "-nomount",
             "-drivekey",
             &format!("{}={id}", registry::LEASE_KEY),

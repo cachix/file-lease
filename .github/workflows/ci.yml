@@ -33,9 +33,47 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint all targets
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Capture native attachment documentation
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          results="$RUNNER_TEMP/file-lease-benchmark"
+          mkdir -p "$results"
+          /usr/bin/hdiutil attach -help > "$results/hdiutil-attach-help.txt" 2>&1 || true
+          /usr/sbin/diskutil image attach -help > "$results/diskutil-attach-help.txt" 2>&1 || true
+          /usr/bin/sw_vers > "$results/os-version.txt"
       - name: Test leases, crash recovery, deadlines, and volume exhaustion
         # macOS tests exercise real RAM volumes and interrupted recovery.
         run: cargo test --locked --all-features -- --test-threads=1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: runner.os == 'macOS'
+        with:
+          persist-credentials: false
+          ref: 0bec586e1ce032878d131a30f584e72d67a8ca28
+          path: baseline
+      - name: Compare default and in-kernel attachment on the same host
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/file-lease-benchmark"
+          mkdir -p "$results/ab"
+          chmod 700 "$results" "$results/ab"
+          # Compile the exact same harness against the unchanged baseline API.
+          cp examples/lifecycle_timings.rs baseline/examples/lifecycle_timings.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example lifecycle_timings
+          cargo build --locked --release --example lifecycle_timings
+          baseline_bin="$RUNNER_TEMP/file-lease-baseline-target/release/examples/lifecycle_timings"
+          kernel_bin="$GITHUB_WORKSPACE/target/release/examples/lifecycle_timings"
+          for round in 0 1 2; do
+            # Alternate order to reduce systematic warm-cache and load bias.
+            variants="baseline kernel"
+            if [[ "$round" == 1 ]]; then variants="kernel baseline"; fi
+            for variant in $variants; do
+              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; else executable="$kernel_bin"; fi
+              "$executable" --samples 10 --files 20 --parallel 4 > "$results/ab/$variant-$round.csv"
+            done
+          done
       - name: Measure release latency and internal phases
         shell: bash
         run: |
