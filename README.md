@@ -352,16 +352,16 @@ with the guardian and existing orphan recovery handling volume cleanup. It is
 not enabled by default, and helpers must be built with the matching feature.
 Linux behavior is unchanged.
 
-A [native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42472849767)
+A [native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42473073797)
 used three alternating rounds, with 30 sequential joins and twelve concurrent
 joins per variant. Medians for overlapping independent leases were:
 
 | macOS 26 operation | Separate volumes | Shared volume |
 | --- | ---: | ---: |
-| Sequential join, including first file | 236.82 ms | 6.67 ms |
-| Independent sequential drop | 32.94 ms | 1.12 ms |
-| Concurrent join | 304.20 ms | 9.07 ms |
-| Initial cold setup | 237.70 ms | 274.46 ms |
+| Sequential join, including first file | 240.61 ms | 5.94 ms |
+| Independent sequential drop | 31.45 ms | 0.88 ms |
+| Concurrent join | 368.58 ms | 8.53 ms |
+| Initial cold setup | 262.05 ms | 253.91 ms |
 
 Each round created fifteen distinct volumes with the baseline and one with the
 prototype. Cold setup still attaches and formats a RAM disk and adds the manager
