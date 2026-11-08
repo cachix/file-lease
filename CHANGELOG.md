@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Experiment with in-kernel macOS RAM-disk attachment to reduce setup overhead.
+- Experiment with omitting unused checks when attaching a new blank macOS RAM disk.
 
 - Add optional metadata-only phase profiling for file-lease latency diagnostics,
   including individual macOS file operations.

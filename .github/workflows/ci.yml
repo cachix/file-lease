@@ -42,6 +42,7 @@ jobs:
           /usr/bin/hdiutil attach -help > "$results/hdiutil-attach-help.txt" 2>&1 || true
           /usr/sbin/diskutil image attach -help > "$results/diskutil-attach-help.txt" 2>&1 || true
           /usr/bin/sw_vers > "$results/os-version.txt"
+          python3 scripts/probe_attachment.py | tee "$results/attachment-probes.jsonl"
       - name: Test leases, crash recovery, deadlines, and volume exhaustion
         # macOS tests exercise real RAM volumes and interrupted recovery.
         run: cargo test --locked --all-features -- --test-threads=1
@@ -51,7 +52,7 @@ jobs:
           persist-credentials: false
           ref: 0bec586e1ce032878d131a30f584e72d67a8ca28
           path: baseline
-      - name: Compare default and in-kernel attachment on the same host
+      - name: Compare default and lean attachment on the same host
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -64,13 +65,13 @@ jobs:
           CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example lifecycle_timings
           cargo build --locked --release --example lifecycle_timings
           baseline_bin="$RUNNER_TEMP/file-lease-baseline-target/release/examples/lifecycle_timings"
-          kernel_bin="$GITHUB_WORKSPACE/target/release/examples/lifecycle_timings"
+          lean_bin="$GITHUB_WORKSPACE/target/release/examples/lifecycle_timings"
           for round in 0 1 2; do
             # Alternate order to reduce systematic warm-cache and load bias.
-            variants="baseline kernel"
-            if [[ "$round" == 1 ]]; then variants="kernel baseline"; fi
+            variants="baseline lean"
+            if [[ "$round" == 1 ]]; then variants="lean baseline"; fi
             for variant in $variants; do
-              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; else executable="$kernel_bin"; fi
+              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; else executable="$lean_bin"; fi
               "$executable" --samples 10 --files 20 --parallel 4 > "$results/ab/$variant-$round.csv"
             done
           done

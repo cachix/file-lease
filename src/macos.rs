@@ -609,8 +609,10 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     attach
         .args([
             "attach",
-            // Avoid the persistent DiskImages helper when supported in-kernel.
-            "-kernel",
+            // This is a newly created, unformatted RAM disk: there is no
+            // image checksum or existing filesystem to check before formatting.
+            "-noverify",
+            "-noautofsck",
             "-nomount",
             "-drivekey",
             &format!("{}={id}", registry::LEASE_KEY),
