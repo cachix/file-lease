@@ -305,6 +305,36 @@ candidate passed all native tests, including descriptor cleanup, crash recovery,
 and volume exhaustion. It remains an experiment; the default implementation
 continues to close writers after allocation.
 
+### Attachment experiment, macOS 26
+
+A [native run on 2026-11-08](https://github.com/cachix/file-lease/actions/runs/42471350859/attempts/2)
+compared attachment changes with the current implementation, using the same
+release-build harness and alternating execution order across three rounds.
+macOS 26 was the optimization target; macOS 15 supplied compatibility coverage.
+
+Forcing `hdiutil attach -kernel` failed with `Function not implemented` on the
+macOS 26 runner. It could not complete setup, so it was rejected rather than
+benchmarked as a working backend. The native tool help and direct probes are
+included in the run's artifacts.
+
+A narrower candidate passed storage and recovery tests: `-noverify -noautofsck`
+omits image checksum and filesystem checks for the newly created blank RAM disk.
+It preserves lease-ID tagging and all later device and mount validation. Each
+variant contributed 30 sequential leases with 600 additional files, plus twelve
+concurrent leases with 240 additional files.
+
+| macOS 26 measurement, median | Current | Omit unused checks |
+| --- | ---: | ---: |
+| Sequential first file, including setup | 226.01 ms | 228.86 ms |
+| Sequential timed lifecycle | 260.36 ms | 269.04 ms |
+| Concurrent first file, including setup | 257.30 ms | 306.92 ms |
+
+These diagnostic samples show no startup improvement. Both candidates remain
+on [`perf/macos-attachment`](https://github.com/cachix/file-lease/tree/perf/macos-attachment)
+and its history; the default attachment behavior is unchanged. Reusing a lease
+amortizes volume creation today. Sharing a volume across independent leases
+would need a separate ownership and isolation design.
+
 ## Development
 
 `cargo test --locked -- --test-threads=1` runs the storage, owner-exit,
