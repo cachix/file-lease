@@ -3,7 +3,8 @@
 ## [Unreleased]
 
 - Add an opt-in macOS shared-volume prototype for overlapping independent
-  leases, retaining separate cleanup and owner handoff within one process.
+  leases, retaining separate cleanup, process-exit revocation, and owner handoff
+  within one process.
 
 - Add optional metadata-only phase profiling for file-lease latency diagnostics,
   including individual macOS file operations.

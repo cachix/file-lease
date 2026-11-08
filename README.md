@@ -352,6 +352,24 @@ with the guardian and existing orphan recovery handling volume cleanup. It is
 not enabled by default, and helpers must be built with the matching feature.
 Linux behavior is unchanged.
 
+A [native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42472849767)
+used three alternating rounds, with 30 sequential joins and twelve concurrent
+joins per variant. Medians for overlapping independent leases were:
+
+| macOS 26 operation | Separate volumes | Shared volume |
+| --- | ---: | ---: |
+| Sequential join, including first file | 236.82 ms | 6.67 ms |
+| Independent sequential drop | 32.94 ms | 1.12 ms |
+| Concurrent join | 304.20 ms | 9.07 ms |
+| Initial cold setup | 237.70 ms | 274.46 ms |
+
+Each round created fifteen distinct volumes with the baseline and one with the
+prototype. Cold setup still attaches and formats a RAM disk and adds the manager
+process; this design accelerates reuse, not the first lease. All native isolation
+and recovery tests passed on macOS 26 and macOS 15. The opt-in prototype remains
+on [`perf/macos-shared-volume`](https://github.com/cachix/file-lease/tree/perf/macos-shared-volume)
+while shared-capacity and manager-failure tradeoffs are evaluated.
+
 `cargo run --locked --release --features shared-volumes --example
 shared_volume_timings` measures cold setup, sequential joins while an anchor lease
 remains live, concurrent joins, independent drops, and final teardown. CI compares

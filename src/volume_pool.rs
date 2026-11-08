@@ -612,4 +612,52 @@ mod tests {
         }
         assert!(!path.exists());
     }
+    #[test]
+    fn disconnect_during_payload_revokes_only_the_interrupted_scope() {
+        let pool = Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let mut first = remote(&pool);
+        let mut second = remote(&pool);
+        let one = first.materialize(b"interrupted-fixture", "").unwrap();
+        let two = second.materialize(b"surviving-fixture", "").unwrap();
+        let mut stream = first.stream.take().unwrap();
+        stream.write_all(&[1]).unwrap();
+        stream.write_all(&128u64.to_le_bytes()).unwrap();
+        stream.write_all(&0u32.to_le_bytes()).unwrap();
+        stream.write_all(b"partial").unwrap();
+        drop(stream);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while one.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!one.exists());
+        assert_eq!(std::fs::read(&two).unwrap(), b"surviving-fixture");
+        second.cleanup().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_owners_exit_does_not_revoke_another_owners_scope() {
+        use crate::FileLease;
+        let anchor = FileLease::new(std::process::id());
+        let one = anchor.materialize(b"live-owner-fixture", None).unwrap();
+        let mut consumer = Command::new("sleep").arg("60").spawn().unwrap();
+        let other = FileLease::new(consumer.id());
+        let two = other.materialize(b"exiting-owner-fixture", None).unwrap();
+        assert_eq!(one.parent(), two.parent());
+        other.handoff().unwrap();
+        consumer.kill().unwrap();
+        consumer.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while two.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!two.exists());
+        assert_eq!(std::fs::read(&one).unwrap(), b"live-owner-fixture");
+        let next = anchor.materialize(b"after-neighbour-exit", None).unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), b"after-neighbour-exit");
+        drop(other);
+        drop(anchor);
+        assert!(!one.exists());
+        assert!(!next.exists());
+    }
 }
