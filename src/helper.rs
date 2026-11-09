@@ -112,7 +112,7 @@ fn read_ready(stream: &mut UnixStream, expected: &[u8; 4], timeout: Duration) ->
                 .checked_duration_since(Instant::now())
                 .filter(|remaining| !remaining.is_zero())
                 .ok_or_else(startup_timeout)?;
-            stream.set_read_timeout(Some(remaining))?;
+            set_read_timeout(stream, Some(remaining))?;
             match stream.read(&mut ready[received..]) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -140,8 +140,19 @@ fn read_ready(stream: &mut UnixStream, expected: &[u8; 4], timeout: Duration) ->
         }
     })();
     // Startup's timeout must not change subsequent allocation or cleanup IO.
-    let restored = stream.set_read_timeout(previous_timeout);
+    let restored = set_read_timeout(stream, previous_timeout);
     handshake.and(restored)
+}
+
+/// macOS rejects socket options with EINVAL once the peer has closed. Reads
+/// on such a socket return immediately, so no timeout is needed to bound them.
+fn set_read_timeout(stream: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
+    match stream.set_read_timeout(timeout) {
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EINVAL) => {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn startup_timeout() -> io::Error {
@@ -192,6 +203,10 @@ mod tests {
     #[test]
     fn silent_helper_startup_times_out_without_waiting_for_its_exit() {
         let (mut stream, remote) = UnixStream::pair().unwrap();
+        // Bound the final read before the helper can exit: macOS rejects
+        // socket options once the peer has closed.
+        let original = Some(Duration::from_secs(2));
+        stream.set_read_timeout(original).unwrap();
         let remote = above_stdio(remote).unwrap();
         let start = Instant::now();
         let error = spawn_with_timeout(
@@ -204,13 +219,24 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(2));
-        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.read_timeout().unwrap(), original);
         // The killed helper must close its inherited channel as it exits.
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
         assert_eq!(
             stream.read_exact(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn closed_peers_accept_timeouts_and_report_eof() {
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        set_read_timeout(&stream, Some(Duration::from_secs(2))).unwrap();
+        set_read_timeout(&stream, None).unwrap();
+        assert_eq!(
+            read_ready(&mut stream, b"TEST", Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::UnexpectedEof
         );
     }
