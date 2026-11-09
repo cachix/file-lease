@@ -1,3 +1,4 @@
+use memmap2::{Advice, MmapOptions, MmapRaw};
 use std::{
     collections::HashMap,
     fs::File,
@@ -97,59 +98,27 @@ impl Storage {
 // Close the descriptor before unmapping and unlocking its pages on drop.
 struct LockedFile {
     file: File,
-    _mapping: Option<LockedMapping>,
+    _mapping: Option<MmapRaw>,
 }
 
-struct LockedMapping {
-    address: *mut libc::c_void,
-    length: usize,
-}
-
-// The mapping is exclusively owned and exposes no Rust references. Moving its
-// guard between threads does not change the mapping or its process-wide lock.
-unsafe impl Send for LockedMapping {}
-
-impl LockedMapping {
-    fn new(file: &File, length: usize) -> io::Result<Self> {
-        // A read-only descriptor prevents VM_MAYWRITE on this shared mapping,
-        // allowing F_SEAL_WRITE while the mapping remains locked and alive.
-        let reader = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-        #[cfg(test)]
-        tests::mapping_checkpoint();
-        let address = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                reader.as_raw_fd(),
-                0,
-            )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let mapping = Self { address, length };
-        if unsafe { libc::madvise(address, length, libc::MADV_DONTDUMP) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Populate and lock zero-filled pages before any secret bytes reach
-        // the memfd. Do not silently accept pageable storage on failure.
-        if unsafe { libc::mlock(address, length) } < 0 {
-            return Err(io::Error::other(format!(
-                "Could not lock secret file pages into RAM; check RLIMIT_MEMLOCK: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        Ok(mapping)
-    }
-}
-
-impl Drop for LockedMapping {
-    fn drop(&mut self) {
-        // Unmapping also releases the memory lock, including on error paths.
-        unsafe { libc::munmap(self.address, self.length) };
-    }
+fn locked_mapping(file: &File, length: usize) -> io::Result<MmapRaw> {
+    // A read-only descriptor prevents VM_MAYWRITE on this shared mapping,
+    // allowing F_SEAL_WRITE while the mapping remains locked and alive.
+    let reader = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    #[cfg(test)]
+    tests::mapping_checkpoint();
+    // Use a raw mapping: the file is written after mapping and locking, so no
+    // Rust references into its contents may be created during initialization.
+    let mapping = MmapOptions::new().len(length).map_raw_read_only(&reader)?;
+    mapping.advise(Advice::DontDump)?;
+    // Populate and lock zero-filled pages before any secret bytes reach the
+    // memfd. Dropping the mapping also unlocks pages, including on error paths.
+    mapping.lock().map_err(|error| {
+        io::Error::other(format!(
+            "Could not lock secret file pages into RAM; check RLIMIT_MEMLOCK: {error}"
+        ))
+    })?;
+    Ok(mapping)
 }
 
 fn anonymous_file(bytes: &[u8]) -> io::Result<LockedFile> {
@@ -167,7 +136,7 @@ fn anonymous_file(bytes: &[u8]) -> io::Result<LockedFile> {
         _mapping: None,
     };
     if !bytes.is_empty() {
-        file._mapping = Some(LockedMapping::new(&file.file, bytes.len())?);
+        file._mapping = Some(locked_mapping(&file.file, bytes.len())?);
     }
     file.file.write_all(bytes)?;
     fcntl_add_seals(

@@ -21,7 +21,6 @@ use super::volume_pool::RemoteStorage as Storage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
-const ALLOCATION_ERROR: u32 = u32::MAX;
 // Version 2 requires locked Linux storage and framed allocation errors. Reject
 // older helpers before sending payloads rather than accepting pageable files.
 #[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
@@ -139,20 +138,11 @@ impl Keeper {
             return Err(io::Error::other("File lease has been handed off"));
         }
         protocol::write_allocation(stream, bytes, suffix)?;
-        let mut length = [0; 4];
-        stream.read_exact(&mut length)?;
-        let reply = u32::from_le_bytes(length);
-        let failed = reply == ALLOCATION_ERROR;
-        let path = if failed {
-            protocol::read_string(stream, MAX_MESSAGE_BYTES)?
-        } else {
-            protocol::read_string_body(stream, reply as usize, MAX_MESSAGE_BYTES)?
-        };
-        if failed {
-            return Err(io::Error::other(format!(
-                "File keeper could not allocate secret storage: {path}"
-            )));
-        }
+        let path = protocol::KEEPER_REPLY.read(stream)?.map_err(|message| {
+            io::Error::other(format!(
+                "File keeper could not allocate secret storage: {message}"
+            ))
+        })?;
         if path.is_empty() {
             return Err(io::Error::other(
                 "File keeper could not allocate secret storage",
@@ -171,12 +161,7 @@ impl Keeper {
         let stream = &mut self.stream;
         stream.write_all(&[RELEASE])?;
         protocol::write_string(stream, path)?;
-        let mut ack = [0];
-        stream.read_exact(&mut ack)?;
-        if ack != [1] {
-            return Err(io::Error::other("File lease release failed"));
-        }
-        Ok(())
+        protocol::read_ack(stream, "File lease release failed")
     }
 
     pub(super) fn handoff_to(&mut self, owner: Option<u32>) -> io::Result<()> {
@@ -187,11 +172,7 @@ impl Keeper {
         if !self.handed_off || owner.is_some() {
             stream.write_all(&[HANDOFF])?;
             stream.write_all(&owner.unwrap_or(0).to_le_bytes())?;
-            let mut ack = [0];
-            stream.read_exact(&mut ack)?;
-            if ack != [1] {
-                return Err(io::Error::other("File lease handoff failed"));
-            }
+            protocol::read_ack(stream, "File lease handoff failed")?;
             self.handed_off = true;
             #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
             self.pool.handoff();
@@ -310,20 +291,11 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                         let path = path
                             .to_str()
                             .ok_or_else(|| io::Error::other("Non-UTF-8 file lease path"))?;
-                        protocol::write_string(&mut stream, path)?;
+                        protocol::KEEPER_REPLY.write(&mut stream, Ok(path))?;
                     }
                     Err(error) => {
                         eprintln!("file-lease storage: {error}");
-                        let message = error.to_string();
-                        let message = if message.len() <= MAX_MESSAGE_BYTES {
-                            &message
-                        } else {
-                            "Secret storage allocation failed (oversized helper error)"
-                        };
-                        // The versioned handshake rejects clients that do not
-                        // understand this bounded error-message frame.
-                        stream.write_all(&ALLOCATION_ERROR.to_le_bytes())?;
-                        protocol::write_string(&mut stream, message)?;
+                        protocol::KEEPER_REPLY.write(&mut stream, Err(&error.to_string()))?;
                     }
                 }
             }
@@ -336,14 +308,14 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                         .and_then(|_| watch_owner(pid))
                         .and_then(|watch| OwnerWatch::start(watch, storage.clone()))
                     else {
-                        stream.write_all(&[0])?;
+                        protocol::write_ack(&mut stream, false)?;
                         continue;
                     };
                     drop(owner_watch);
                     owner_watch = next;
                 }
                 handed_off = true;
-                stream.write_all(&[1])?;
+                protocol::write_ack(&mut stream, true)?;
             }
             RELEASE => {
                 let path = protocol::read_string(&mut stream, MAX_MESSAGE_BYTES)?;
@@ -351,7 +323,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                     .lock()
                     .map_err(|_| io::Error::other("Storage lock poisoned"))?
                     .release(Path::new(&path));
-                stream.write_all(&[u8::from(result.is_ok())])?;
+                protocol::write_ack(&mut stream, result.is_ok())?;
             }
             CLOSE => break,
             _ => return Err(io::Error::other("Invalid file keeper operation")),
