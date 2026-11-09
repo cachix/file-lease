@@ -140,6 +140,8 @@ fn main() -> std::io::Result<()> {
 
 Library and helper versions and feature configurations must match. The helper
 wire protocol and recovery format are internal.
+Helper readiness has a ten-second deadline; a helper that does not complete
+the startup handshake is terminated and allocation returns `TimedOut`.
 
 ## Platform support
 

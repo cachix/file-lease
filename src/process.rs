@@ -26,11 +26,15 @@ impl ProcessInfo {
         {
             use std::os::unix::ffi::OsStringExt;
             let root = PathBuf::from(format!("/proc/{pid}"));
-            let stat = std::fs::read_to_string(root.join("stat"))?;
-            let fields: Vec<_> = stat
-                .rsplit_once(')')
-                .ok_or_else(|| io::Error::other("Invalid process status"))?
-                .1
+            let stat = std::fs::read(root.join("stat"))?;
+            // The parenthesized process name is arbitrary bytes and may itself
+            // contain ')'. Only the fields after its final delimiter are text.
+            let end = stat
+                .iter()
+                .rposition(|byte| *byte == b')')
+                .ok_or_else(|| io::Error::other("Invalid process status"))?;
+            let fields: Vec<_> = std::str::from_utf8(&stat[end + 1..])
+                .map_err(io::Error::other)?
                 .split_whitespace()
                 .collect();
             let field = |index: usize| -> io::Result<u64> {
@@ -156,5 +160,38 @@ impl ProcessInfo {
                 "File lease process inspection requires Linux or macOS",
             ))
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_utf8_process_name_child() {
+        if std::env::var_os("_FILE_LEASE_NON_UTF8_PROCESS_NAME_TEST").is_none() {
+            return;
+        }
+        // Include a closing parenthesis too: stat's comm field is not escaped.
+        std::fs::write("/proc/self/comm", b"probe )\xff\n").unwrap();
+        let info = ProcessInfo::read(std::process::id()).unwrap();
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.parent, unsafe { libc::getppid() } as u32);
+        assert_eq!(info.group, unsafe { libc::getpgrp() } as u32);
+        assert!(info.executed);
+        assert_eq!(info.executable, std::env::current_exe().unwrap());
+        assert!(!info.arguments.is_empty());
+    }
+
+    #[test]
+    fn process_metadata_accepts_non_utf8_names() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process::tests::non_utf8_process_name_child"])
+                .env("_FILE_LEASE_NON_UTF8_PROCESS_NAME_TEST", "1")
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }

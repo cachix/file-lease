@@ -7,6 +7,7 @@ use std::{
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 pub(crate) fn close_on_exec(fd: RawFd) -> io::Result<()> {
@@ -52,6 +53,22 @@ pub(crate) fn spawn(
     stream: &mut UnixStream,
     expected: &[u8; 4],
 ) -> io::Result<Child> {
+    spawn_with_timeout(
+        command,
+        inherited,
+        stream,
+        expected,
+        Duration::from_secs(10),
+    )
+}
+
+fn spawn_with_timeout(
+    command: &mut Command,
+    inherited: Vec<OwnedFd>,
+    stream: &mut UnixStream,
+    expected: &[u8; 4],
+    timeout: Duration,
+) -> io::Result<Child> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -74,20 +91,64 @@ pub(crate) fn spawn(
         .stderr(Stdio::inherit());
     let mut child = command.spawn()?;
     drop(inherited);
-    let mut ready = [0; 4];
-    let handshake = stream.read_exact(&mut ready).and_then(|_| {
+    if let Err(error) = read_ready(stream, expected, timeout) {
+        let _ = child.kill();
+        // Even a killed child can take time to exit. Reap it asynchronously so
+        // a failed startup cannot leave the caller waiting without a bound.
+        reap_when_exited(child);
+        return Err(error);
+    }
+    Ok(child)
+}
+
+fn read_ready(stream: &mut UnixStream, expected: &[u8; 4], timeout: Duration) -> io::Result<()> {
+    let previous_timeout = stream.read_timeout()?;
+    let deadline = Instant::now() + timeout;
+    let handshake = (|| {
+        let mut ready = [0; 4];
+        let mut received = 0;
+        while received < ready.len() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(startup_timeout)?;
+            stream.set_read_timeout(Some(remaining))?;
+            match stream.read(&mut ready[received..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "File lease keeper exited before readiness",
+                    ));
+                }
+                Ok(count) => received += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(startup_timeout());
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if &ready == expected {
             Ok(())
         } else {
             Err(io::Error::other("Incompatible file lease keeper"))
         }
-    });
-    if let Err(error) = handshake {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    Ok(child)
+    })();
+    // Startup's timeout must not change subsequent allocation or cleanup IO.
+    let restored = stream.set_read_timeout(previous_timeout);
+    handshake.and(restored)
+}
+
+fn startup_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "File lease keeper startup timed out",
+    )
 }
 
 pub(crate) fn disable_core_dumps() -> io::Result<()> {
@@ -127,6 +188,54 @@ pub(crate) fn reap_when_exited(child: Child) {
 mod tests {
     use super::*;
     use std::{io::Write, os::fd::IntoRawFd, time::Duration};
+
+    #[test]
+    fn silent_helper_startup_times_out_without_waiting_for_its_exit() {
+        let (mut stream, remote) = UnixStream::pair().unwrap();
+        let remote = above_stdio(remote).unwrap();
+        let start = Instant::now();
+        let error = spawn_with_timeout(
+            Command::new("sh").args(["-c", "exec sleep 60"]),
+            vec![remote.into()],
+            &mut stream,
+            b"TEST",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        // The killed helper must close its inherited channel as it exits.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(
+            stream.read_exact(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn partial_readiness_times_out_and_restores_the_socket_timeout() {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        let original = Some(Duration::from_secs(2));
+        stream.set_read_timeout(original).unwrap();
+        peer.write_all(b"T").unwrap();
+        let error = read_ready(&mut stream, b"TEST", Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(stream.read_timeout().unwrap(), original);
+    }
+
+    #[test]
+    fn successful_readiness_restores_the_socket_timeout() {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"TESTnext").unwrap();
+        read_ready(&mut stream, b"TEST", Duration::from_secs(2)).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        let mut next = [0; 4];
+        stream.read_exact(&mut next).unwrap();
+        assert_eq!(&next, b"next");
+    }
 
     #[test]
     fn inherited_channels_restore_close_on_exec_and_transfer_ownership() {
