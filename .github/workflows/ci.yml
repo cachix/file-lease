@@ -33,9 +33,69 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint all targets
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test leases, crash recovery, deadlines, and volume exhaustion
-        # macOS tests exercise real RAM volumes and interrupted recovery.
+      - name: Lint the separate-volume opt-out
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Test default leases, crash recovery, deadlines, and volume exhaustion
+        # macOS tests exercise real pooled volumes and interrupted recovery.
+        run: cargo test --locked -- --test-threads=1
+      - name: Test separate-volume opt-out
+        run: cargo test --locked --no-default-features -- --test-threads=1
+      - name: Test all features
         run: cargo test --locked --all-features -- --test-threads=1
+      - name: Verify documentation and the release package
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --locked --no-deps --all-features
+          cargo package --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: runner.os == 'macOS'
+        with:
+          persist-credentials: false
+          ref: 05b802b15bc8daf136bb068bec992c60b15bf96b
+          path: baseline
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: runner.os == 'macOS'
+        with:
+          persist-credentials: false
+          ref: f42cf6d8c6d87da2138565ab421fabed18a83b63
+          path: previous
+      - name: Compare overlapping independent leases
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/file-lease-benchmark"
+          mkdir -p "$results/ab"
+          chmod 700 "$results" "$results/ab"
+          cp examples/shared_volume_timings.rs baseline/examples/shared_volume_timings.rs
+          cp examples/shared_volume_timings.rs previous/examples/shared_volume_timings.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example shared_volume_timings
+          CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-previous-target" cargo build --locked --release --features shared-volumes --manifest-path previous/Cargo.toml --example shared_volume_timings
+          cargo build --locked --release --example shared_volume_timings
+          baseline_bin="$RUNNER_TEMP/file-lease-baseline-target/release/examples/shared_volume_timings"
+          previous_bin="$RUNNER_TEMP/file-lease-previous-target/release/examples/shared_volume_timings"
+          pooled_bin="$GITHUB_WORKSPACE/target/release/examples/shared_volume_timings"
+          for round in 0 1 2; do
+            variants="baseline previous pooled"
+            if [[ "$round" == 1 ]]; then variants="pooled baseline previous"; fi
+            if [[ "$round" == 2 ]]; then variants="previous pooled baseline"; fi
+            for variant in $variants; do
+              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; elif [[ "$variant" == previous ]]; then executable="$previous_bin"; else executable="$pooled_bin"; fi
+              "$executable" --samples 10 --parallel 4 > "$results/ab/$variant-$round.csv"
+            done
+          done
+          mkdir -p "$results/spillover"
+          for round in 0 1 2; do
+            variants="baseline previous pooled"
+            if [[ "$round" == 1 ]]; then variants="pooled baseline previous"; fi
+            if [[ "$round" == 2 ]]; then variants="previous pooled baseline"; fi
+            for variant in $variants; do
+              if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; elif [[ "$variant" == previous ]]; then executable="$previous_bin"; else executable="$pooled_bin"; fi
+              "$executable" --samples 3 --parallel 4 --payload-mib 24 > "$results/spillover/$variant-$round.csv"
+            done
+          done
       - name: Measure release latency and internal phases
         shell: bash
         run: |

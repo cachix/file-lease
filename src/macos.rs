@@ -859,6 +859,21 @@ impl Storage {
         }
         let volume = self.volume.as_ref().unwrap();
         let root = volume.open_root()?;
+        #[cfg(feature = "shared-volumes")]
+        {
+            // Query the pinned, validated mount before opening a payload file.
+            // This rejects known-full volumes without writing partial payloads.
+            // Free space is only a preflight: metadata or other writers may
+            // still cause ENOSPC during the write, which remains authoritative.
+            let mut info = MaybeUninit::<libc::statfs>::zeroed();
+            if unsafe { libc::fstatfs(root.as_raw_fd(), info.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let info = unsafe { info.assume_init() };
+            if bytes.len() as u64 > info.f_bavail.saturating_mul(u64::from(info.f_bsize)) {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+        }
         let _span = super::profiling::Span::new("file.write");
         self.counter = self
             .counter
@@ -1480,6 +1495,41 @@ mod tests {
         drop(lease);
         recover_orphans(&runtime_root().unwrap()).unwrap();
         removed(&directory, id);
+    }
+
+    #[cfg(feature = "shared-volumes")]
+    #[test]
+    fn dead_shared_manager_and_guardians_leave_all_volumes_recoverable() {
+        let pool = crate::volume_pool::Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let first = crate::FileLease::new(std::process::id());
+        let second = crate::FileLease::new(std::process::id());
+        let payload = vec![54; 40 * 1024 * 1024];
+        let one = first.materialize(&payload, None).unwrap();
+        let two = second.materialize(&payload, None).unwrap();
+        assert_ne!(one.parent(), two.parent());
+        let states: Vec<_> = [&one, &two]
+            .into_iter()
+            .map(|path| {
+                let directory = path.parent().unwrap().parent().unwrap().to_path_buf();
+                let id = Journal::read(&directory).unwrap().lease_id.unwrap();
+                let guardian: u32 = fs::read_to_string(directory.join("setup.ready"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(unsafe { libc::kill(guardian as _, libc::SIGKILL) }, 0);
+                (directory, id)
+            })
+            .collect();
+        assert_eq!(unsafe { libc::kill(pool.pid() as _, libc::SIGKILL) }, 0);
+        drop(first);
+        drop(second);
+        drop(pool);
+        recover_orphans(&runtime_root().unwrap()).unwrap();
+        for (directory, id) in states {
+            removed(&directory, id);
+        }
+        assert!(!one.exists());
+        assert!(!two.exists());
     }
 
     #[test]

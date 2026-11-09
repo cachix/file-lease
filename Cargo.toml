@@ -9,8 +9,11 @@ description = "Process-owned memory-backed files with automatic cleanup"
 readme = "README.md"
 
 [features]
+default = ["shared-volumes"]
 # Internal diagnostics for synthetic benchmarks; disabled in ordinary builds.
 profiling = []
+# Share macOS volumes across overlapping leases from one process.
+shared-volumes = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

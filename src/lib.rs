@@ -19,6 +19,11 @@ mod macos_registry;
 mod platform;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod profiling;
+#[cfg(all(
+    feature = "shared-volumes",
+    any(target_os = "macos", all(test, target_os = "linux"))
+))]
+mod volume_pool;
 
 /// A cloneable lease on memory-backed files.
 ///

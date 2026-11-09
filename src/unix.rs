@@ -11,8 +11,12 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use super::linux::{Storage, watch_owner};
+#[cfg(all(target_os = "macos", not(feature = "shared-volumes")))]
+use super::macos::Storage;
 #[cfg(target_os = "macos")]
-use super::macos::{Storage, watch_owner};
+use super::macos::watch_owner;
+#[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+use super::volume_pool::RemoteStorage as Storage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
@@ -24,12 +28,18 @@ const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
 const ALLOCATION_ERROR: u32 = u32::MAX;
 // Version 2 requires locked Linux storage and framed allocation errors. Reject
 // older helpers before sending payloads rather than accepting pageable files.
+#[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
 const READY: &[u8; 4] = b"SFL2";
+#[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+// Shared-volume helpers require a separate inherited scope channel.
+const READY: &[u8; 4] = b"SFL3";
 
 pub(super) struct Keeper {
     stream: Mutex<UnixStream>,
     child: Mutex<Option<Child>>,
     handed_off: AtomicBool,
+    #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+    pool: Arc<super::volume_pool::Pool>,
 }
 
 fn valid_pid(pid: u32) -> io::Result<()> {
@@ -41,7 +51,7 @@ fn valid_pid(pid: u32) -> io::Result<()> {
 }
 
 // Descriptors inherited through exec must not collide with child stdio setup.
-fn above_stdio<T: Into<OwnedFd> + From<OwnedFd>>(descriptor: T) -> io::Result<T> {
+pub(crate) fn above_stdio<T: Into<OwnedFd> + From<OwnedFd>>(descriptor: T) -> io::Result<T> {
     let descriptor = descriptor.into();
     if descriptor.as_raw_fd() >= 3 {
         return Ok(descriptor.into());
@@ -94,7 +104,16 @@ impl Keeper {
                 }
             }
         };
+        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        let pool = super::volume_pool::Pool::get(&executable)?;
+        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        let volume_channel = above_stdio(pool.connect()?)?;
         let mut command = Command::new(executable);
+        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        command.env(
+            super::volume_pool::channel_env(),
+            volume_channel.as_raw_fd().to_string(),
+        );
         command
             .env(SOCKET_ENV, socket_fd.to_string())
             .env(OWNER_ENV, owner_arg)
@@ -116,6 +135,12 @@ impl Keeper {
         let inherited = vec![socket_fd, owner_fd];
         #[cfg(target_os = "macos")]
         let inherited = vec![socket_fd];
+        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        let inherited = {
+            let mut descriptors = inherited;
+            descriptors.push(volume_channel.as_raw_fd());
+            descriptors
+        };
         unsafe {
             command.pre_exec(move || {
                 for fd in &inherited {
@@ -149,6 +174,8 @@ impl Keeper {
             stream: Mutex::new(stream),
             child: Mutex::new(Some(child)),
             handed_off: AtomicBool::new(false),
+            #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+            pool,
         })
     }
 
@@ -244,6 +271,8 @@ impl Keeper {
                 return Err(io::Error::other("File lease handoff failed"));
             }
             self.handed_off.store(true, Ordering::Release);
+            #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+            self.pool.handoff();
         }
         Ok(())
     }
@@ -273,6 +302,13 @@ pub(super) fn maybe_run_keeper() -> Option<i32> {
     #[cfg(target_os = "macos")]
     if let Some(result) = super::macos::maybe_run_setup() {
         return Some(result.map_or_else(|_| 1, |_| 0));
+    }
+    #[cfg(all(
+        feature = "shared-volumes",
+        any(target_os = "macos", all(test, target_os = "linux"))
+    ))]
+    if let Some(code) = super::volume_pool::maybe_run() {
+        return Some(code);
     }
     let socket = std::env::var(SOCKET_ENV).ok()?;
     Some(run_keeper(&socket).map_or_else(
@@ -339,7 +375,11 @@ fn run_keeper(socket: &str) -> io::Result<()> {
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let storage = Arc::new(Mutex::new(Storage::default()));
+    #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+    let storage = Storage::from_env()?;
+    #[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
+    let storage = Storage::default();
+    let storage = Arc::new(Mutex::new(storage));
     let mut owner_watch = OwnerWatch::start(owner, storage.clone())?;
     stream.write_all(READY)?;
     let mut handed_off = false;
