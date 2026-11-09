@@ -147,3 +147,11 @@ on the library dependency and build the helper with `--no-default-features`.
 Cargo features are additive: another dependency enabling `shared-volumes` also
 enables pooling for your application.
 
+## Alternatives
+
+| Alternative | When it fits | What `file-lease` adds |
+| --- | --- | --- |
+| [`tempfile`](https://crates.io/crates/tempfile) | Temporary files on a filesystem you choose. | Memory-backed storage without a disk-backed fallback, plus cleanup tied to a selected process. Named temporary files otherwise rely on destructors for cleanup. |
+| [`memfd`](https://crates.io/crates/memfd), [`memfile`](https://crates.io/crates/memfile) | Creating and sealing anonymous files on supported systems. | A helper that hosts paths, owner monitoring, handoff, and a macOS backend. |
+| [`memfd_path`](https://crates.io/crates/memfd_path) | An in-memory Linux file accessed through `/proc/self/fd/...`. | Paths hosted independently of the launcher, without requiring the consumer to inherit the file descriptor. |
+| [`shared_memory`](https://crates.io/crates/shared_memory), [`native-ipc`](https://crates.io/crates/native-ipc) | Sharing mappings between cooperating processes. | File paths that ordinary programs can open without shared-memory integration. |

@@ -48,8 +48,6 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: |
           cargo doc --locked --no-deps --all-features
-          cargo build --locked --lib
-          rustdoc --edition=2024 --test docs/usage.md --extern file_lease=target/debug/libfile_lease.rlib -L dependency=target/debug/deps
           cargo package --locked
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: runner.os == 'macOS'

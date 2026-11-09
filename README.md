@@ -53,7 +53,9 @@ does not retain the file.
 ## Control the lifetime
 
 Storage is allocated lazily on the first `materialize` call. The selected owner
-is identified by its PID and watched by a separate helper.
+is identified by its PID and watched by a separate helper. Use the launcher PID
+when it waits for its consumers, or a shell or manager PID for longer-lived
+files. `ProcessInfo` helps identify a consuming shell or manager.
 
 | Operation | Behaviour |
 | --- | --- |
@@ -68,8 +70,63 @@ Hand off before replacing the launcher with `exec` or letting it exit. After
 handoff, no clone can allocate more files. Handing off an empty lease has no
 effect.
 
-See [usage and deployment](https://github.com/cachix/file-lease/blob/main/docs/usage.md)
-for `exec`, detached consumers, and embedding the helper in your own executable.
+### Replacing the launcher with the consumer
+
+Unix `exec` replaces the current executable without changing its PID. Hand off
+before `exec` so the helper keeps the files alive after the launcher's Rust
+objects disappear. This example replaces the launcher with `cat`:
+
+```rust,no_run
+use file_lease::FileLease;
+use std::{io, process::Command};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+fn main() -> io::Result<()> {
+    let lease = FileLease::new(std::process::id());
+    let path = lease.materialize(b"application data\n", None)?;
+    lease.handoff()?;
+    drop(lease); // The helper now retains the file until this PID exits.
+
+    Err(Command::new("cat").arg(&path).exec())
+}
+# #[cfg(not(unix))]
+# fn main() {}
+```
+
+For a detached consumer, call `handoff_to(consumer_pid)` while both the current
+owner and consumer are still alive. Complete the handoff before letting the
+launcher exit. If a program daemonizes, use the PID of the process that will
+actually need the files.
+
+## Helper deployment
+
+By default, the library looks for `file-lease` beside the current executable,
+then on PATH. Use `with_keeper_executable` to select an explicit helper path;
+configure it before cloning the lease.
+
+Applications can also host the helper in their own executable. Dispatch its
+internal invocations before argument parsing:
+
+```rust,no_run
+use file_lease::{FileLease, maybe_run_keeper};
+
+fn main() -> std::io::Result<()> {
+    if let Some(code) = maybe_run_keeper() {
+        std::process::exit(code);
+    }
+
+    let lease = FileLease::new(std::process::id())
+        .with_keeper_executable(std::env::current_exe()?);
+    let path = lease.materialize(b"application data", None)?;
+    assert_eq!(std::fs::read(&path)?, b"application data");
+    Ok(())
+}
+```
+
+Library and helper versions and feature configurations must match. The helper
+wire protocol and recovery format are internal.
 
 ## Platform support
 
@@ -94,11 +151,7 @@ describes owner monitoring, crash recovery, capacity, and the separate-volume
 build option. [Performance measurements](https://github.com/cachix/file-lease/blob/main/docs/performance.md)
 cover startup, reuse, and cleanup costs on macOS 15 and 26.
 
-## Deployment and limits
-
-Install a matching helper beside your executable or on `PATH`, or select it with
-`with_keeper_executable`. Library and helper versions and feature configurations
-must match. The helper protocol is internal.
+## Limits
 
 Payloads are limited to 64 MiB per request. Suffixes accept up to 80 ASCII
 letters, digits, dots, underscores, or hyphens. macOS pool growth has no fixed

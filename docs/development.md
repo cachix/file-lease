@@ -5,8 +5,8 @@ ownership-transfer, helper-crash, closed-descriptor, and macOS setup-recovery
 tests. CI runs default, all-feature, and no-default-feature builds on native
 Linux and macOS hosts.
 
-The README example is a Cargo documentation test. CI also compiles the examples
-in `docs/usage.md` with rustdoc so the longer deployment examples stay checked.
+The README examples are Cargo documentation tests, including the `exec` and
+embedded-helper examples.
 
 `cargo run --locked --release --example lifecycle_timings` measures first-file
 setup, additional-file allocation, and cleanup with synthetic 256-byte files.
