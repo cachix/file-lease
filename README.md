@@ -1,31 +1,44 @@
 # file-lease
 
+[![CI](https://github.com/cachix/file-lease/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/cachix/file-lease/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/file-lease.svg)](https://crates.io/crates/file-lease)
+[![Documentation](https://docs.rs/file-lease/badge.svg)](https://docs.rs/file-lease)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/cachix/file-lease/blob/main/LICENSE)
+[![Rust: 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://github.com/cachix/file-lease/blob/main/Cargo.toml)
+
 **Memory-backed files with ordinary paths and process-owned lifetimes.**
+
+Linux uses sealed `memfd` files with locked memory, exposed through
+`/proc/<helper-pid>/fd/<fd>`. macOS uses private HFS RAM disks that provide
+ordinary filesystem paths. Neither backend falls back to regular disk-backed
+temporary files.
 
 Pass credentials, certificates, and generated configuration to programs that
 expect a file. `file-lease` creates a read-only, memory-backed file and keeps its
 path available until the lease ends or its selected owner process exits.
 
 The consumer opens the path normally. It needs no library integration and does
-not need to inherit a file descriptor. Allocation never falls back to a regular
-temporary file.
+not need to inherit a file descriptor.
 
 ## Get started
 
-The crate is not yet published. Build the helper from a checkout:
-
-```sh
-git clone https://github.com/cachix/file-lease.git
-cd file-lease
-cargo install --path . --locked
-```
-
-Add the checkout as a dependency in your application:
+Requires Rust 1.92 or newer. Add the library to your application:
 
 ```toml
 [dependencies]
-file-lease = { path = "../file-lease" }
+file-lease = "1.0"
 ```
+
+Install the matching helper executable:
+
+```sh
+cargo install file-lease --version 1.0.0 --locked
+```
+
+Use the same version and feature configuration for the library and helper.
+You can also [embed the helper in your application](#helper-deployment).
+To build the helper from a checkout, run `cargo install --path . --locked`
+from the repository root and use that checkout as a path dependency.
 
 With the helper installed, create a file and pass its path to a consumer:
 
@@ -135,6 +148,8 @@ wire protocol and recovery format are internal.
 | Linux | Sealed `memfd` files with pages locked before payload writes. | `/proc/<helper-pid>/fd/<fd>`; suffix hints are omitted. |
 | macOS | Private HFS RAM volumes, shared across overlapping leases by default. | Ordinary file paths; suffix hints are preserved. |
 | Windows | Not supported yet. | Allocation returns `Unsupported`. |
+
+Other operating systems also return `Unsupported` on allocation.
 
 On Linux, configure sufficient `RLIMIT_MEMLOCK`; allocation fails if pages cannot
 be locked. Consumers must be able to open the helper's proc-fd paths directly.
