@@ -67,13 +67,99 @@ pub(crate) fn read_string(stream: &mut impl Read, maximum: usize) -> io::Result<
     read_string_body(stream, u32::from_le_bytes(length) as usize, maximum)
 }
 
-// Allocation replies reserve one length value as an error marker, so their
-// caller reads the first length before deciding which string frame follows.
-pub(crate) fn read_string_body(
-    stream: &mut impl Read,
-    length: usize,
-    maximum: usize,
-) -> io::Result<String> {
+pub(crate) fn read_ack(stream: &mut impl Read, failure: &'static str) -> io::Result<()> {
+    let mut ack = [0];
+    stream.read_exact(&mut ack)?;
+    if ack == [1] {
+        Ok(())
+    } else {
+        Err(io::Error::other(failure))
+    }
+}
+
+pub(crate) fn write_ack(stream: &mut impl Write, success: bool) -> io::Result<()> {
+    stream.write_all(&[u8::from(success)])
+}
+
+fn bounded_error<'a>(message: &'a str, fallback: &'a str) -> &'a str {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        message
+    } else {
+        fallback
+    }
+}
+
+/// Lease helpers encode success as a path string and failure as a reserved
+/// length followed by an error string. Keep this distinct from scope replies.
+pub(crate) mod keeper_reply {
+    use super::*;
+
+    const ALLOCATION_ERROR: u32 = u32::MAX;
+
+    pub(crate) fn read(stream: &mut impl Read) -> io::Result<Result<String, String>> {
+        let mut length = [0; 4];
+        stream.read_exact(&mut length)?;
+        let length = u32::from_le_bytes(length);
+        if length == ALLOCATION_ERROR {
+            Ok(Err(read_string(stream, MAX_MESSAGE_BYTES)?))
+        } else {
+            Ok(Ok(read_string_body(
+                stream,
+                length as usize,
+                MAX_MESSAGE_BYTES,
+            )?))
+        }
+    }
+
+    pub(crate) fn write(stream: &mut impl Write, reply: Result<&str, &str>) -> io::Result<()> {
+        match reply {
+            Ok(path) => write_string(stream, path),
+            Err(message) => {
+                stream.write_all(&ALLOCATION_ERROR.to_le_bytes())?;
+                write_string(
+                    stream,
+                    bounded_error(
+                        message,
+                        "Secret storage allocation failed (oversized helper error)",
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// Volume scopes prefix both path and error strings with a status byte.
+#[cfg(all(
+    feature = "shared-volumes",
+    any(target_os = "macos", all(test, target_os = "linux"))
+))]
+pub(crate) mod scope_reply {
+    use super::*;
+
+    pub(crate) fn read(stream: &mut impl Read) -> io::Result<Result<String, String>> {
+        let mut status = [0];
+        stream.read_exact(&mut status)?;
+        let message = read_string(stream, MAX_MESSAGE_BYTES)?;
+        Ok(if status == [1] {
+            Ok(message)
+        } else {
+            Err(message)
+        })
+    }
+
+    pub(crate) fn write(stream: &mut impl Write, reply: Result<&str, &str>) -> io::Result<()> {
+        write_ack(stream, reply.is_ok())?;
+        write_string(
+            stream,
+            match reply {
+                Ok(path) => path,
+                Err(message) => bounded_error(message, "Volume allocation failed"),
+            },
+        )
+    }
+}
+
+fn read_string_body(stream: &mut impl Read, length: usize, maximum: usize) -> io::Result<String> {
     if length > maximum {
         return Err(io::Error::other("Oversized protocol message"));
     }
@@ -85,6 +171,137 @@ pub(crate) fn read_string_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_reply_codec(
+        read: impl Fn(&mut &[u8]) -> io::Result<Result<String, String>>,
+        write: impl Fn(&mut Vec<u8>, Result<&str, &str>) -> io::Result<()>,
+        success: &[u8],
+        failure: &[u8],
+        fallback: &str,
+    ) {
+        for (reply, expected) in [(Ok("/key"), success), (Err("full"), failure)] {
+            let mut frame = Vec::new();
+            write(&mut frame, reply).unwrap();
+            assert_eq!(frame, expected);
+            assert_eq!(
+                read(&mut &expected[..])
+                    .unwrap()
+                    .as_deref()
+                    .map_err(String::as_str),
+                reply
+            );
+            for end in 0..expected.len() {
+                assert_eq!(
+                    read(&mut &expected[..end]).unwrap_err().kind(),
+                    io::ErrorKind::UnexpectedEof,
+                );
+            }
+            *frame.last_mut().unwrap() = 0xff;
+            assert!(read(&mut &frame[..]).is_err());
+        }
+
+        // Several replies can share one stream. A recoverable allocation
+        // failure must leave the following reply readable.
+        let mut frames = Vec::new();
+        for frame in [success, failure, success] {
+            frames.extend_from_slice(frame);
+        }
+        let mut incoming = &frames[..];
+        for expected in [Ok("/key"), Err("full"), Ok("/key")] {
+            assert_eq!(
+                read(&mut incoming)
+                    .unwrap()
+                    .as_deref()
+                    .map_err(String::as_str),
+                expected
+            );
+        }
+        assert!(incoming.is_empty());
+
+        let mut frame = Vec::new();
+        let maximum = "a".repeat(MAX_MESSAGE_BYTES);
+        for reply in [Ok(maximum.as_str()), Err(maximum.as_str())] {
+            frame.clear();
+            write(&mut frame, reply).unwrap();
+            assert_eq!(
+                read(&mut &frame[..])
+                    .unwrap()
+                    .as_deref()
+                    .map_err(String::as_str),
+                reply
+            );
+        }
+        frame.clear();
+        // A multibyte error is replaced as a whole rather than truncated in
+        // the middle of a UTF-8 character.
+        write(&mut frame, Err(&"€".repeat(MAX_MESSAGE_BYTES))).unwrap();
+        assert_eq!(read(&mut &frame[..]).unwrap(), Err(fallback.to_owned()));
+    }
+
+    #[test]
+    fn keeper_reply_wire_format_and_error_boundaries() {
+        check_reply_codec(
+            |stream| keeper_reply::read(stream),
+            keeper_reply::write,
+            b"\x04\0\0\0/key",
+            b"\xff\xff\xff\xff\x04\0\0\0full",
+            "Secret storage allocation failed (oversized helper error)",
+        );
+        for prefix in [&b""[..], &b"\xff\xff\xff\xff"[..]] {
+            let mut frame = prefix.to_vec();
+            frame.extend_from_slice(&(MAX_MESSAGE_BYTES as u32 + 1).to_le_bytes());
+            let error = keeper_reply::read(&mut &frame[..]).unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[cfg(feature = "shared-volumes")]
+    #[test]
+    fn scope_reply_wire_format_and_error_boundaries() {
+        check_reply_codec(
+            |stream| scope_reply::read(stream),
+            scope_reply::write,
+            b"\x01\x04\0\0\0/key",
+            b"\x00\x04\0\0\0full",
+            "Volume allocation failed",
+        );
+        for status in [0, 1] {
+            let mut frame = vec![status];
+            frame.extend_from_slice(&(MAX_MESSAGE_BYTES as u32 + 1).to_le_bytes());
+            let error = scope_reply::read(&mut &frame[..]).unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+        // Preserve the existing rule that any non-success status is failure.
+        assert_eq!(
+            scope_reply::read(&mut &b"\x02\x04\0\0\0full"[..]).unwrap(),
+            Err("full".to_owned()),
+        );
+    }
+
+    #[test]
+    fn acknowledgements_preserve_wire_format_and_failure_context() {
+        let mut frame = Vec::new();
+        write_ack(&mut frame, true).unwrap();
+        write_ack(&mut frame, false).unwrap();
+        assert_eq!(frame, [1, 0]);
+        let mut incoming = &frame[..];
+        read_ack(&mut incoming, "release failed").unwrap();
+        assert_eq!(
+            read_ack(&mut incoming, "release failed")
+                .unwrap_err()
+                .to_string(),
+            "release failed"
+        );
+        assert_eq!(
+            read_ack(&mut incoming, "release failed")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        for status in [2, 255] {
+            assert!(read_ack(&mut &[status][..], "release failed").is_err());
+        }
+    }
 
     #[test]
     fn allocation_frames_preserve_the_existing_wire_format() {

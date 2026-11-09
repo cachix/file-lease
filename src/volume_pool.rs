@@ -6,14 +6,19 @@ use super::linux::Storage;
 #[cfg(target_os = "macos")]
 use super::macos::Storage;
 use super::protocol::{
-    ALLOCATE, CLOSE, MAX_MESSAGE_BYTES, RELEASE, read_allocation, read_string, write_allocation,
-    write_string,
+    ALLOCATE, CLOSE, MAX_MESSAGE_BYTES, RELEASE, read_ack, read_allocation, read_string,
+    scope_reply, write_ack, write_allocation, write_string,
+};
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
 };
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, Read, Write},
+    io::{self, IoSlice, IoSliceMut, Read, Write},
+    mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
         unix::net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -83,12 +88,8 @@ impl Pool {
         let stream = guard
             .as_mut()
             .ok_or_else(|| io::Error::other("Volume pool closed"))?;
-        send_fd(stream, local.as_raw_fd())?;
-        let mut ack = [0];
-        stream.read_exact(&mut ack)?;
-        if ack != [1] {
-            return Err(io::Error::other("Volume scope registration failed"));
-        }
+        send_fd(stream, local.as_fd())?;
+        read_ack(stream, "Volume scope registration failed")?;
         Ok(remote.into())
     }
 
@@ -121,74 +122,54 @@ impl Drop for Pool {
     }
 }
 
-fn send_fd(stream: &UnixStream, fd: i32) -> io::Result<()> {
-    let mut byte = [1u8];
-    let mut vector = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: 1,
-    };
-    let mut control = [0usize; 8];
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut vector;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as _) } as _;
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<i32>(), fd);
-        if libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) != 1 {
-            return Err(io::Error::last_os_error());
-        }
+fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
+    let descriptors = [fd];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    assert!(control.push(SendAncillaryMessage::ScmRights(&descriptors)));
+    #[cfg(target_os = "macos")]
+    rustix::net::sockopt::set_socket_nosigpipe(stream, true)?;
+    #[cfg(target_os = "macos")]
+    let flags = SendFlags::empty();
+    #[cfg(target_os = "linux")]
+    let flags = SendFlags::NOSIGNAL;
+    if sendmsg(stream, &[IoSlice::new(&[1])], &mut control, flags)? != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "Volume scope registration was not sent",
+        ));
     }
     Ok(())
 }
 
 fn receive_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
     let mut byte = [0u8];
-    let mut vector = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: 1,
-    };
-    let mut control = [0usize; 8];
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut vector;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of_val(&control) as _;
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
     let received = loop {
-        let result = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, 0) };
-        if result >= 0 {
-            break result;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        match recvmsg(
+            stream,
+            &mut [IoSliceMut::new(&mut byte)],
+            &mut control,
+            RecvFlags::empty(),
+        ) {
+            Ok(received) => break received,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
         }
     };
-    if received == 0 {
+    if received.bytes == 0 {
         return Ok(None);
     }
-    // Own every received descriptor immediately, even for malformed messages.
+    // Rustix owns all received descriptors, including on malformed messages
+    // and when unread ancillary data is dropped.
     let mut descriptors = Vec::new();
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&message);
-        while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let bytes =
-                    ((*header).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
-                for index in 0..bytes / std::mem::size_of::<i32>() {
-                    let fd =
-                        std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<i32>().add(index));
-                    descriptors.push(OwnedFd::from_raw_fd(fd));
-                }
-            }
-            header = libc::CMSG_NXTHDR(&message, header);
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(rights) = message {
+            descriptors.extend(rights);
         }
     }
-    if byte != [1] || descriptors.len() != 1 || message.msg_flags & libc::MSG_CTRUNC != 0 {
+    if byte != [1] || descriptors.len() != 1 || received.flags.contains(ReturnFlags::CTRUNC) {
         return Err(io::Error::other("Invalid volume scope registration"));
     }
     let descriptor = descriptors.pop().unwrap();
@@ -218,14 +199,9 @@ impl RemoteStorage {
             .as_mut()
             .ok_or_else(|| io::Error::other("Volume scope closed"))?;
         write_allocation(stream, bytes, suffix)?;
-        let mut status = [0];
-        stream.read_exact(&mut status)?;
-        let message = read_string(stream, MAX_MESSAGE_BYTES)?;
-        if status == [1] {
-            Ok(PathBuf::from(message))
-        } else {
-            Err(io::Error::other(message))
-        }
+        scope_reply::read(stream)?
+            .map(PathBuf::from)
+            .map_err(io::Error::other)
     }
     pub(crate) fn release(&mut self, path: &Path) -> io::Result<()> {
         let path = path
@@ -237,24 +213,12 @@ impl RemoteStorage {
             .ok_or_else(|| io::Error::other("Volume scope closed"))?;
         stream.write_all(&[RELEASE])?;
         write_string(stream, path)?;
-        let mut ack = [0];
-        stream.read_exact(&mut ack)?;
-        if ack == [1] {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                "Path does not belong to this volume scope",
-            ))
-        }
+        read_ack(stream, "Path does not belong to this volume scope")
     }
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {
         if let Some(mut stream) = self.stream.take() {
             stream.write_all(&[CLOSE])?;
-            let mut ack = [0];
-            stream.read_exact(&mut ack)?;
-            if ack != [1] {
-                return Err(io::Error::other("Volume scope cleanup failed"));
-            }
+            read_ack(&mut stream, "Volume scope cleanup failed")?;
         }
         Ok(())
     }
@@ -374,7 +338,7 @@ fn run(fd: &str) -> io::Result<()> {
         std::thread::Builder::new()
             .name("volume-scope".into())
             .spawn(move || serve(channel, shared))?;
-        control.write_all(&[1])?;
+        write_ack(&mut control, true)?;
     }
     let mut state_guard = state
         .lock()
@@ -407,24 +371,15 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                     match allocated {
                         Ok(path) => {
                             paths.insert(path.clone());
-                            stream.write_all(&[1])?;
-                            write_string(
+                            scope_reply::write(
                                 &mut stream,
-                                path.to_str()
-                                    .ok_or_else(|| io::Error::other("Non-UTF-8 volume path"))?,
+                                Ok(path
+                                    .to_str()
+                                    .ok_or_else(|| io::Error::other("Non-UTF-8 volume path"))?),
                             )?;
                         }
                         Err(error) => {
-                            stream.write_all(&[0])?;
-                            let message = error.to_string();
-                            write_string(
-                                &mut stream,
-                                if message.len() <= MAX_MESSAGE_BYTES {
-                                    &message
-                                } else {
-                                    "Volume allocation failed"
-                                },
-                            )?;
+                            scope_reply::write(&mut stream, Err(&error.to_string()))?;
                         }
                     }
                 }
@@ -440,7 +395,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                     if released {
                         paths.remove(&path);
                     }
-                    stream.write_all(&[u8::from(released)])?;
+                    write_ack(&mut stream, released)?;
                 }
                 CLOSE => return Ok(true),
                 _ => return Err(io::Error::other("Invalid volume operation")),
@@ -454,7 +409,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
         std::process::exit(1);
     }
     if matches!(close_requested, Ok(true)) {
-        let _ = stream.write_all(&[1]);
+        let _ = write_ack(&mut stream, true);
     }
     if let Ok(mut state) = state.lock() {
         disconnect(&mut state);
@@ -606,6 +561,63 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&[9]).unwrap();
         assert!(receive_fd(&server).is_err());
+    }
+
+    #[test]
+    fn registered_descriptors_transfer_ownership_and_are_close_on_exec() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (channel, mut peer) = UnixStream::pair().unwrap();
+        send_fd(&client, channel.as_fd()).unwrap();
+        drop(channel);
+        let descriptor = receive_fd(&server).unwrap().unwrap();
+        assert!(
+            rustix::io::fcntl_getfd(&descriptor)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        let mut channel = UnixStream::from(descriptor);
+        channel.write_all(b"scope").unwrap();
+        let mut bytes = [0; 5];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"scope");
+        drop(channel);
+        assert_eq!(peer.read(&mut bytes).unwrap(), 0);
+        drop(client);
+        assert!(receive_fd(&server).unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_registrations_close_all_received_descriptors() {
+        // Exercise a wrong marker, missing or extra descriptors, and ancillary
+        // truncation. EOF proves no received copy of the channel leaked.
+        for (marker, count) in [(9, 1), (1, 0), (1, 2), (1, 16)] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let (channel, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let descriptors = vec![channel.as_fd(); count];
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(16))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            if count != 0 {
+                assert!(control.push(SendAncillaryMessage::ScmRights(&descriptors)));
+            }
+            assert_eq!(
+                sendmsg(
+                    &client,
+                    &[IoSlice::new(&[marker])],
+                    &mut control,
+                    SendFlags::empty(),
+                )
+                .unwrap(),
+                1
+            );
+            drop(channel);
+            assert!(
+                receive_fd(&server).is_err(),
+                "marker={marker}, count={count}"
+            );
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0, "count={count}");
+        }
     }
 
     #[test]
