@@ -33,6 +33,14 @@ const CONTROL: &str = "_FILE_LEASE_VOLUME_CONTROL";
 #[cfg(target_os = "macos")]
 const CHANNEL: &str = "_FILE_LEASE_VOLUME_CHANNEL";
 const READY: &[u8; 4] = b"FLV1";
+// XNU installs every received right before copying control data to userspace.
+// Truncation can therefore leak descriptors whose numbers were never returned.
+// Cover XNU's UIPC_MAX_CMSG_FD bound, then reject extra rights after owning them.
+// https://github.com/bytecodealliance/rustix/issues/1683
+#[cfg(target_os = "macos")]
+const REGISTRATION_FD_CAPACITY: usize = 512;
+#[cfg(target_os = "linux")]
+const REGISTRATION_FD_CAPACITY: usize = 2;
 
 pub(crate) struct Pool {
     control: Mutex<Option<UnixStream>>,
@@ -144,7 +152,8 @@ fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> io::Result<()> {
 
 fn receive_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
     let mut byte = [0u8];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut space =
+        [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(REGISTRATION_FD_CAPACITY))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
     let received = loop {
         match recvmsg(
@@ -588,8 +597,9 @@ mod tests {
 
     #[test]
     fn malformed_registrations_close_all_received_descriptors() {
-        // Exercise a wrong marker, missing or extra descriptors, and ancillary
-        // truncation. EOF proves no received copy of the channel leaked.
+        // Exercise a wrong marker and missing or extra descriptors. Linux also
+        // truncates the sixteen-rights frame; macOS must receive it in full to
+        // avoid leaking rights in the kernel. EOF proves every copy was closed.
         for (marker, count) in [(9, 1), (1, 0), (1, 2), (1, 16)] {
             let (client, server) = UnixStream::pair().unwrap();
             let (channel, mut peer) = UnixStream::pair().unwrap();
@@ -616,7 +626,10 @@ mod tests {
                 receive_fd(&server).is_err(),
                 "marker={marker}, count={count}"
             );
-            assert_eq!(peer.read(&mut [0]).unwrap(), 0, "count={count}");
+            let received = peer
+                .read(&mut [0])
+                .unwrap_or_else(|error| panic!("marker={marker}, count={count}: {error}"));
+            assert_eq!(received, 0, "marker={marker}, count={count}");
         }
     }
 
