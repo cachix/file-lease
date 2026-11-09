@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Recover macOS lease directories after a failed RAM disk attachment, and
+  after another volume reuses a detached lease's disk number.
+
 - Treat macOS payloads deleted by their consumers as released, so one deleted
   file no longer stops the shared volume manager and revokes every other lease.
 
