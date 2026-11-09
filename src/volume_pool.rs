@@ -523,7 +523,7 @@ mod tests {
     fn scope_cleanup_revokes_every_path_despite_one_failure() {
         let state = Mutex::new(State {
             storage: VolumeSet::default(),
-            connections: 2,
+            connections: 1,
         });
         let path = state
             .lock()
