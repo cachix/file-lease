@@ -6,7 +6,6 @@ use std::{
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[cfg(target_os = "linux")]
@@ -34,10 +33,12 @@ const READY: &[u8; 4] = b"SFL2";
 // Shared-volume helpers require a separate inherited scope channel.
 const READY: &[u8; 4] = b"SFL3";
 
+// FileLease owns this behind its shared mutex. Mutable access serializes the
+// request stream, handoff state, and child lifecycle together.
 pub(super) struct Keeper {
-    stream: Mutex<UnixStream>,
-    child: Mutex<Option<Child>>,
-    handed_off: AtomicBool,
+    stream: UnixStream,
+    child: Option<Child>,
+    handed_off: bool,
     #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
     pool: Arc<super::volume_pool::Pool>,
 }
@@ -66,7 +67,7 @@ pub(crate) fn above_stdio<T: Into<OwnedFd> + From<OwnedFd>>(descriptor: T) -> io
 impl Keeper {
     #[cfg(test)]
     pub(super) fn pid(&self) -> u32 {
-        self.child.lock().unwrap().as_ref().unwrap().id()
+        self.child.as_ref().unwrap().id()
     }
 
     pub(super) fn spawn(owner: u32, executable: Option<&Path>) -> io::Result<Self> {
@@ -171,15 +172,15 @@ impl Keeper {
             return Err(io::Error::other("Incompatible file lease keeper"));
         }
         Ok(Self {
-            stream: Mutex::new(stream),
-            child: Mutex::new(Some(child)),
-            handed_off: AtomicBool::new(false),
+            stream,
+            child: Some(child),
+            handed_off: false,
             #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
             pool,
         })
     }
 
-    pub(super) fn materialize(&self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
+    pub(super) fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
         let _span = super::profiling::Span::new("lease.allocate");
         if bytes.len() as u64 > MAX_SECRET_BYTES {
             return Err(io::Error::other("Secret exceeds file lease size limit"));
@@ -191,11 +192,8 @@ impl Keeper {
         {
             return Err(io::Error::other("Invalid secret file suffix"));
         }
-        let mut stream = self
-            .stream
-            .lock()
-            .map_err(|_| io::Error::other("File keeper lock poisoned"))?;
-        if self.handed_off.load(Ordering::Acquire) {
+        let stream = &mut self.stream;
+        if self.handed_off {
             return Err(io::Error::other("File lease has been handed off"));
         }
         stream.write_all(&[ALLOCATE])?;
@@ -232,17 +230,14 @@ impl Keeper {
         Ok(PathBuf::from(path))
     }
 
-    pub(super) fn release(&self, path: &Path) -> io::Result<()> {
+    pub(super) fn release(&mut self, path: &Path) -> io::Result<()> {
         let path = path
             .to_str()
             .ok_or_else(|| io::Error::other("Non-UTF-8 lease path"))?;
         if path.len() > 16384 {
             return Err(io::Error::other("Oversized lease path"));
         }
-        let mut stream = self
-            .stream
-            .lock()
-            .map_err(|_| io::Error::other("File keeper lock poisoned"))?;
+        let stream = &mut self.stream;
         stream.write_all(&[RELEASE])?;
         stream.write_all(&(path.len() as u32).to_le_bytes())?;
         stream.write_all(path.as_bytes())?;
@@ -254,15 +249,12 @@ impl Keeper {
         Ok(())
     }
 
-    pub(super) fn handoff_to(&self, owner: Option<u32>) -> io::Result<()> {
+    pub(super) fn handoff_to(&mut self, owner: Option<u32>) -> io::Result<()> {
         if let Some(pid) = owner {
             valid_pid(pid)?;
         }
-        let mut stream = self
-            .stream
-            .lock()
-            .map_err(|_| io::Error::other("File keeper lock poisoned"))?;
-        if !self.handed_off.load(Ordering::Acquire) || owner.is_some() {
+        let stream = &mut self.stream;
+        if !self.handed_off || owner.is_some() {
             stream.write_all(&[HANDOFF])?;
             stream.write_all(&owner.unwrap_or(0).to_le_bytes())?;
             let mut ack = [0];
@@ -270,7 +262,7 @@ impl Keeper {
             if ack != [1] {
                 return Err(io::Error::other("File lease handoff failed"));
             }
-            self.handed_off.store(true, Ordering::Release);
+            self.handed_off = true;
             #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
             self.pool.handoff();
         }
@@ -281,17 +273,13 @@ impl Keeper {
 impl Drop for Keeper {
     fn drop(&mut self) {
         let _span = super::profiling::Span::new("lease.cleanup");
-        if let Ok(child) = self.child.get_mut()
-            && let Some(mut child) = child.take()
-        {
-            if self.handed_off.load(Ordering::Acquire) {
+        if let Some(mut child) = self.child.take() {
+            if self.handed_off {
                 reap_when_exited(child);
             } else {
                 // Graceful shutdown also unmounts macOS volumes. If the keeper
                 // was killed, its macOS guardian independently cleans up.
-                if let Ok(stream) = self.stream.get_mut() {
-                    let _ = stream.write_all(&[CLOSE]);
-                }
+                let _ = self.stream.write_all(&[CLOSE]);
                 let _ = child.wait();
             }
         }
