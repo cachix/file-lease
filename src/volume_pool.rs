@@ -333,11 +333,12 @@ impl VolumeSet {
 
 struct State {
     storage: VolumeSet,
-    active: usize,
-    controller: bool,
+    // The controller and each scope keep the manager alive until disconnect.
+    connections: usize,
 }
-fn finish(state: &mut State) {
-    if !state.controller && state.active == 0 {
+fn disconnect(state: &mut State) {
+    state.connections -= 1;
+    if state.connections == 0 {
         let result = state.storage.cleanup();
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
@@ -361,15 +362,14 @@ fn run(fd: &str) -> io::Result<()> {
     helper::disable_core_dumps()?;
     let state = Arc::new(Mutex::new(State {
         storage: VolumeSet::default(),
-        active: 0,
-        controller: true,
+        connections: 1,
     }));
     control.write_all(READY)?;
     while let Some(channel) = receive_fd(&control)? {
         state
             .lock()
             .map_err(|_| io::Error::other("Volume state poisoned"))?
-            .active += 1;
+            .connections += 1;
         let shared = state.clone();
         std::thread::Builder::new()
             .name("volume-scope".into())
@@ -379,8 +379,7 @@ fn run(fd: &str) -> io::Result<()> {
     let mut state_guard = state
         .lock()
         .map_err(|_| io::Error::other("Volume state poisoned"))?;
-    state_guard.controller = false;
-    finish(&mut state_guard);
+    disconnect(&mut state_guard);
     drop(state_guard);
     // Live scopes remain after the launcher exits or drops handed-off leases.
     loop {
@@ -460,8 +459,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
     }
     let _ = result;
     if let Ok(mut state) = state.lock() {
-        state.active -= 1;
-        finish(&mut state);
+        disconnect(&mut state);
     } else {
         std::process::exit(1);
     }
@@ -526,6 +524,41 @@ mod tests {
         client.write_all(&[9]).unwrap();
         assert!(receive_fd(&server).is_err());
     }
+
+    #[test]
+    fn controller_disconnect_keeps_scopes_alive_until_the_last_disconnect() {
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+
+        let pool = Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let mut first = remote(&pool);
+        let mut second = remote(&pool);
+        let one = first.materialize(b"first-scope", "").unwrap();
+        let two = second.materialize(b"last-scope", "").unwrap();
+        // Close registration while retaining the child handle for a bounded wait.
+        drop(pool.control.lock().unwrap().take());
+        first.cleanup().unwrap();
+        assert!(!one.exists());
+        assert_eq!(std::fs::read(&two).unwrap(), b"last-scope");
+        let three = second.materialize(b"after-controller-exit", "").unwrap();
+        // EOF on the final scope must revoke its paths and exit the manager.
+        drop(second.stream.take());
+        let mut child = pool.child.lock().unwrap();
+        let child = child.as_mut().unwrap();
+        let status = child.wait_timeout(Duration::from_secs(10)).unwrap();
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(
+            status
+                .expect("Manager outlived its final connection")
+                .success()
+        );
+        assert!(!two.exists());
+        assert!(!three.exists());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn independent_handoff_and_keeper_death_preserve_neighbours() {
