@@ -482,11 +482,14 @@ fn cleanup_paths(paths: &mut HashSet<PathBuf>, state: &Mutex<State>) -> io::Resu
     let mut state = state
         .lock()
         .map_err(|_| io::Error::other("Volume state poisoned"))?;
-    for path in paths.iter() {
-        state.storage.release(path)?;
+    let mut failure = None;
+    // One unrevocable path must not leave this scope's other paths readable.
+    for path in paths.drain() {
+        if let Err(error) = state.storage.release(&path) {
+            failure.get_or_insert(error);
+        }
     }
-    paths.clear();
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "macos")]
@@ -530,6 +533,53 @@ mod tests {
         assert!(!two.exists());
         drop(again);
         drop(pool);
+    }
+
+    #[test]
+    fn scope_cleanup_revokes_every_path_despite_one_failure() {
+        let state = Mutex::new(State {
+            storage: VolumeSet::default(),
+            active: 1,
+            controller: true,
+        });
+        let path = state
+            .lock()
+            .unwrap()
+            .storage
+            .materialize(b"scope-cleanup-fixture", "")
+            .unwrap();
+        let mut paths = HashSet::from([PathBuf::from("/not-a-pooled-path"), path.clone()]);
+        assert!(cleanup_paths(&mut paths, &state).is_err());
+        assert!(paths.is_empty());
+        assert!(!path.exists());
+        state.lock().unwrap().storage.cleanup().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn consumer_deleted_payloads_do_not_fail_the_shared_manager() {
+        let pool = Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let mut first = remote(&pool);
+        let mut second = remote(&pool);
+        let released = first.materialize(b"released-fixture", "").unwrap();
+        let closed = first.materialize(b"closed-fixture", "").unwrap();
+        let neighbour = second.materialize(b"neighbour-fixture", "").unwrap();
+        std::fs::remove_file(&released).unwrap();
+        std::fs::remove_file(&closed).unwrap();
+        first.release(&released).unwrap();
+        // An acknowledged close proves the manager survived revoking a
+        // missing name rather than exiting and revoking every scope.
+        first.cleanup().unwrap();
+        assert!(matches!(
+            pool.child.lock().unwrap().as_mut().unwrap().try_wait(),
+            Ok(None)
+        ));
+        assert_eq!(std::fs::read(&neighbour).unwrap(), b"neighbour-fixture");
+        let next = second.materialize(b"after-delete-fixture", "").unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), b"after-delete-fixture");
+        second.cleanup().unwrap();
+        assert!(!neighbour.exists());
+        assert!(!next.exists());
     }
 
     #[test]
