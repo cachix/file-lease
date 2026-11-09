@@ -23,7 +23,8 @@ pub enum ErrorKind {
     TooLarge,
     /// The lease was handed off and cannot allocate more files.
     HandedOff,
-    /// The helper could not be started or speaks an incompatible protocol.
+    /// The helper could not be found or started, or it was built from a
+    /// different version or feature set than this library.
     Helper,
     /// The helper could not allocate storage. On Linux this includes an
     /// insufficient `RLIMIT_MEMLOCK`; on macOS, an exhausted RAM volume.

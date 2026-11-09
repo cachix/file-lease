@@ -126,9 +126,10 @@ actually need the files.
 
 ## Helper deployment
 
-By default, the library looks for `file-lease` beside the current executable,
-then on PATH. Use `with_helper_executable` to select an explicit helper path;
-configure it before cloning the lease.
+By default, the library runs `file-lease` from the directory of the current
+executable. It never searches PATH, since the helper receives every payload.
+Use `with_helper_executable` to select another path; configure it before
+cloning the lease.
 
 Applications can also host the helper in their own executable. Dispatch its
 internal invocations before argument parsing:
@@ -150,7 +151,8 @@ fn main() -> std::io::Result<()> {
 ```
 
 Library and helper versions and feature configurations must match. The helper
-wire protocol and recovery format are internal.
+reports its build at startup, and a mismatch fails with `ErrorKind::Helper`
+before any payload is sent. The wire protocol and recovery format are internal.
 Helper readiness has a ten-second deadline; a helper that does not complete
 the startup handshake is terminated and allocation returns `TimedOut`.
 
