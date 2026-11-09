@@ -384,7 +384,8 @@ fn all_security_mount_flags_are_required() {
 #[test]
 fn unmounted_storage_never_writes_or_releases_on_the_backing_disk() {
     let lease = crate::FileLease::new(std::process::id());
-    let path = lease.materialize(b"ram-only-fixture", None).unwrap();
+    let file = lease.materialize(b"ram-only-fixture").unwrap();
+    let path = file.path().to_owned();
     let mount = path.parent().unwrap();
     validate_mount_flags(mount_info(mount).unwrap().f_flags).unwrap();
     command("/sbin/umount", &["-f".as_ref(), mount.as_os_str()]).unwrap();
@@ -392,15 +393,15 @@ fn unmounted_storage_never_writes_or_releases_on_the_backing_disk() {
     // A release must not delete its unrelated file, and another allocation
     // must not put any payload bytes here.
     fs::write(&path, b"unrelated-disk-fixture").unwrap();
-    let allocation = lease.materialize(b"must-not-reach-disk", None);
-    let release = lease.release(&path);
+    let allocation = lease.materialize(b"must-not-reach-disk");
+    let release = lease.release(&file);
     let disk_contents = fs::read(&path).unwrap();
     let disk_entries = fs::read_dir(mount).unwrap().count();
     fs::remove_file(&path).unwrap();
     let replacement = tempfile::tempdir().unwrap();
     fs::remove_dir(mount).unwrap();
     std::os::unix::fs::symlink(replacement.path(), mount).unwrap();
-    let symlink_allocation = lease.materialize(b"must-not-follow-symlink", None);
+    let symlink_allocation = lease.materialize(b"must-not-follow-symlink");
     let replacement_entries = fs::read_dir(replacement.path()).unwrap().count();
     fs::remove_file(mount).unwrap();
     fs::DirBuilder::new().mode(0o700).create(mount).unwrap();
@@ -416,10 +417,10 @@ fn unmounted_storage_never_writes_or_releases_on_the_backing_disk() {
 #[test]
 fn storage_rejects_weakened_root_permissions() {
     let lease = crate::FileLease::new(std::process::id());
-    let path = lease.materialize(b"private-fixture", None).unwrap();
+    let path = lease.materialize(b"private-fixture").unwrap().into_path();
     let mount = path.parent().unwrap();
     fs::set_permissions(mount, fs::Permissions::from_mode(0o755)).unwrap();
-    let allocation = lease.materialize(b"must-stay-private", None);
+    let allocation = lease.materialize(b"must-stay-private");
     fs::set_permissions(mount, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(allocation.is_err());
     assert_eq!(fs::read(&path).unwrap(), b"private-fixture");
@@ -428,7 +429,10 @@ fn storage_rejects_weakened_root_permissions() {
 #[test]
 fn storage_rejects_replaced_device_identity() {
     let lease = crate::FileLease::new(std::process::id());
-    let path = lease.materialize(b"device-identity-fixture", None).unwrap();
+    let path = lease
+        .materialize(b"device-identity-fixture")
+        .unwrap()
+        .into_path();
     let directory = path.parent().unwrap().parent().unwrap().to_path_buf();
     let mut journal = Journal::read(&directory).unwrap();
     journal.device_identity = Some([0; 4]);
@@ -553,7 +557,7 @@ fn stopped_setup_worker_does_not_block_other_leases() {
     let thread = std::thread::spawn(move || {
         let lease = crate::FileLease::new(std::process::id());
         let result = lease
-            .materialize(b"independent-lease", None)
+            .materialize(b"independent-lease")
             .map(|path| (lease, path));
         let _ = sender.send(result);
     });
@@ -569,7 +573,7 @@ fn stopped_setup_worker_does_not_block_other_leases() {
 }
 
 fn lease_state(lease: &crate::FileLease) -> (PathBuf, PathBuf, uuid::Uuid, u32) {
-    let path = lease.materialize(b"guardian-test", None).unwrap();
+    let path = lease.materialize(b"guardian-test").unwrap().into_path();
     let directory = path.parent().unwrap().parent().unwrap().to_path_buf();
     let journal = Journal::read(&directory).unwrap();
     let guardian = fs::read_to_string(directory.join("setup.ready"))
@@ -630,8 +634,8 @@ fn dead_shared_manager_and_guardians_leave_all_volumes_recoverable() {
     let first = crate::FileLease::new(std::process::id());
     let second = crate::FileLease::new(std::process::id());
     let payload = vec![54; 40 * 1024 * 1024];
-    let one = first.materialize(&payload, None).unwrap();
-    let two = second.materialize(&payload, None).unwrap();
+    let one = first.materialize(&payload).unwrap().into_path();
+    let two = second.materialize(&payload).unwrap().into_path();
     assert_ne!(one.parent(), two.parent());
     let states: Vec<_> = [&one, &two]
         .into_iter()

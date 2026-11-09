@@ -136,7 +136,10 @@ fn read_ready(stream: &mut UnixStream, expected: &[u8; 4], timeout: Duration) ->
         if &ready == expected {
             Ok(())
         } else {
-            Err(io::Error::other("Incompatible file lease keeper"))
+            Err(crate::error::tagged(
+                crate::error::ErrorKind::Helper,
+                "Incompatible file lease keeper",
+            ))
         }
     })();
     // Startup's timeout must not change subsequent allocation or cleanup IO.

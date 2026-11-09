@@ -43,14 +43,17 @@ from the repository root and use that checkout as a path dependency.
 With the helper installed, create a file and pass its path to a consumer:
 
 ```rust,no_run
-use file_lease::FileLease;
+use file_lease::{FileLease, FileOptions};
 use std::{io, process::Command};
 
 fn main() -> io::Result<()> {
     let lease = FileLease::new(std::process::id());
-    let path = lease.materialize(b"endpoint = 'https://example.com'\n", Some(".toml"))?;
+    let file = lease.materialize_with(
+        b"endpoint = 'https://example.com'\n",
+        &FileOptions::new().suffix(".toml"),
+    )?;
 
-    let status = Command::new("cat").arg(&path).status()?;
+    let status = Command::new("cat").arg(file.path()).status()?;
     drop(lease);
 
     if !status.success() {
@@ -60,8 +63,8 @@ fn main() -> io::Result<()> {
 }
 ```
 
-Keep the lease alive for every read, including later reopens. A `PathBuf` alone
-does not retain the file.
+Keep the lease alive for every read, including later reopens. A `LeasedFile`
+names a file but does not retain it.
 
 ## Control the lifetime
 
@@ -75,13 +78,21 @@ files. `ProcessInfo` helps identify a consuming shell or manager.
 | `FileLease::new(pid)` | Tie the lease to a process. Its exit triggers cleanup. |
 | `clone()` | Share the same lease and files. |
 | Drop the last clone | Clean up and wait, unless the lease has been handed off. |
-| `release(&path)` | Revoke one file and keep the rest. |
+| `release(&file)` | Revoke one file and keep the rest. |
 | `handoff()` | Retain existing files until the original owner exits. |
 | `handoff_to(pid)` | Transfer existing files to another live process. |
 
 Hand off before replacing the launcher with `exec` or letting it exit. After
 handoff, no clone can allocate more files. Handing off an empty lease has no
 effect.
+
+Owners are identified by PID, so choose a process that is alive when the first
+file is created. A PID that has already exited and been reused would tie the
+lease to the unrelated process.
+
+Operations return `file_lease::Error`, whose `kind()` distinguishes invalid
+owners, suffixes and sizes, handed-off leases, helper and storage failures, and
+rejected releases or handoffs. It converts into `io::Error` for `?`.
 
 ### Replacing the launcher with the consumer
 
@@ -98,11 +109,11 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 fn main() -> io::Result<()> {
     let lease = FileLease::new(std::process::id());
-    let path = lease.materialize(b"application data\n", None)?;
+    let file = lease.materialize(b"application data\n")?;
     lease.handoff()?;
     drop(lease); // The helper now retains the file until this PID exits.
 
-    Err(Command::new("cat").arg(&path).exec())
+    Err(Command::new("cat").arg(file.path()).exec())
 }
 # #[cfg(not(unix))]
 # fn main() {}
@@ -116,24 +127,24 @@ actually need the files.
 ## Helper deployment
 
 By default, the library looks for `file-lease` beside the current executable,
-then on PATH. Use `with_keeper_executable` to select an explicit helper path;
+then on PATH. Use `with_helper_executable` to select an explicit helper path;
 configure it before cloning the lease.
 
 Applications can also host the helper in their own executable. Dispatch its
 internal invocations before argument parsing:
 
 ```rust,no_run
-use file_lease::{FileLease, maybe_run_keeper};
+use file_lease::{FileLease, maybe_run_helper};
 
 fn main() -> std::io::Result<()> {
-    if let Some(code) = maybe_run_keeper() {
+    if let Some(code) = maybe_run_helper() {
         std::process::exit(code);
     }
 
     let lease = FileLease::new(std::process::id())
-        .with_keeper_executable(std::env::current_exe()?);
-    let path = lease.materialize(b"application data", None)?;
-    assert_eq!(std::fs::read(&path)?, b"application data");
+        .with_helper_executable(std::env::current_exe()?);
+    let file = lease.materialize(b"application data")?;
+    assert_eq!(std::fs::read(&file)?, b"application data");
     Ok(())
 }
 ```

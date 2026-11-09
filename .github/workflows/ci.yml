@@ -69,8 +69,9 @@ jobs:
           results="$RUNNER_TEMP/file-lease-benchmark"
           mkdir -p "$results/ab"
           chmod 700 "$results" "$results/ab"
-          cp examples/shared_volume_timings.rs baseline/examples/shared_volume_timings.rs
-          cp examples/shared_volume_timings.rs previous/examples/shared_volume_timings.rs
+          # Both refs predate the 1.0 API. Previous carries the same benchmark
+          # written against that API; keep its logic in sync with this one.
+          cp previous/examples/shared_volume_timings.rs baseline/examples/shared_volume_timings.rs
           CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example shared_volume_timings
           CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-previous-target" cargo build --locked --release --features shared-volumes --manifest-path previous/Cargo.toml --example shared_volume_timings
           cargo build --locked --release --example shared_volume_timings
@@ -106,7 +107,7 @@ jobs:
           uname -a | tee "$results/host.txt"
           rustc --version | tee -a "$results/host.txt"
           cargo run --locked --release --example lifecycle_timings | tee "$results/release.csv"
-          _FILE_LEASE_PROFILE_DIR="$results/phases" cargo run --locked --release --features profiling --example lifecycle_timings | tee "$results/profiled.csv"
+          _FILE_LEASE_PROFILE_DIR="$results/phases" cargo run --locked --release --features unstable-profiling --example lifecycle_timings | tee "$results/profiled.csv"
           python3 scripts/summarize_timings.py "$results" | tee "$results/summary.csv"
           {
             echo '### Release latency and nested phase timings (milliseconds)'

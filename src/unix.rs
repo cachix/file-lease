@@ -1,6 +1,7 @@
 use super::helper::{self, above_stdio, reap_when_exited};
 use super::protocol::{self, ALLOCATE, CLOSE, HANDOFF, MAX_MESSAGE_BYTES, RELEASE};
 use super::*;
+use crate::error::{ErrorKind, tagged};
 use std::{
     io::{Read, Write},
     os::{
@@ -41,10 +42,20 @@ pub(super) struct Keeper {
 
 fn valid_pid(pid: u32) -> io::Result<()> {
     if pid == 0 || pid > i32::MAX as u32 {
-        Err(io::Error::other("Invalid file lease owner PID"))
+        Err(tagged(
+            ErrorKind::InvalidOwner,
+            "Invalid file lease owner PID",
+        ))
     } else {
         Ok(())
     }
+}
+
+fn invalid_owner(error: io::Error) -> io::Error {
+    tagged(
+        ErrorKind::InvalidOwner,
+        format!("Cannot watch file lease owner: {error}"),
+    )
 }
 
 impl Keeper {
@@ -57,11 +68,11 @@ impl Keeper {
         let _span = super::profiling::Span::new("lease.helper_spawn");
         valid_pid(owner)?;
         #[cfg(target_os = "macos")]
-        let owner_info = super::macos::process_info(owner)?;
+        let owner_info = super::macos::process_info(owner).map_err(invalid_owner)?;
         #[cfg(target_os = "macos")]
         let owner_arg = owner.to_string();
         #[cfg(target_os = "linux")]
-        let owner = above_stdio(watch_owner(owner)?)?;
+        let owner = above_stdio(watch_owner(owner).map_err(invalid_owner)?)?;
         let (stream, remote) = UnixStream::pair()?;
         let mut stream = above_stdio(stream)?;
         let remote = above_stdio(remote)?;
@@ -135,16 +146,21 @@ impl Keeper {
         let _span = super::profiling::Span::new("lease.allocate");
         let stream = &mut self.stream;
         if self.handed_off {
-            return Err(io::Error::other("File lease has been handed off"));
+            return Err(tagged(
+                ErrorKind::HandedOff,
+                "File lease has been handed off",
+            ));
         }
         protocol::write_allocation(stream, bytes, suffix)?;
         let path = protocol::KEEPER_REPLY.read(stream)?.map_err(|message| {
-            io::Error::other(format!(
-                "File keeper could not allocate secret storage: {message}"
-            ))
+            tagged(
+                ErrorKind::Storage,
+                format!("File keeper could not allocate secret storage: {message}"),
+            )
         })?;
         if path.is_empty() {
-            return Err(io::Error::other(
+            return Err(tagged(
+                ErrorKind::Storage,
                 "File keeper could not allocate secret storage",
             ));
         }
@@ -154,14 +170,14 @@ impl Keeper {
     pub(super) fn release(&mut self, path: &Path) -> io::Result<()> {
         let path = path
             .to_str()
-            .ok_or_else(|| io::Error::other("Non-UTF-8 lease path"))?;
-        if path.len() > MAX_MESSAGE_BYTES {
-            return Err(io::Error::other("Oversized lease path"));
-        }
+            .filter(|path| path.len() <= MAX_MESSAGE_BYTES)
+            .ok_or_else(|| tagged(ErrorKind::Release, "Path does not belong to this lease"))?;
         let stream = &mut self.stream;
         stream.write_all(&[RELEASE])?;
         protocol::write_string(stream, path)?;
-        protocol::read_ack(stream, "File lease release failed")
+        protocol::read_ack(stream, || {
+            tagged(ErrorKind::Release, "File lease release failed")
+        })
     }
 
     pub(super) fn handoff_to(&mut self, owner: Option<u32>) -> io::Result<()> {
@@ -172,7 +188,9 @@ impl Keeper {
         if !self.handed_off || owner.is_some() {
             stream.write_all(&[HANDOFF])?;
             stream.write_all(&owner.unwrap_or(0).to_le_bytes())?;
-            protocol::read_ack(stream, "File lease handoff failed")?;
+            protocol::read_ack(stream, || {
+                tagged(ErrorKind::Handoff, "File lease handoff failed")
+            })?;
             self.handed_off = true;
             #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
             self.pool.handoff();

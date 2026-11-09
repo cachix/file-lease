@@ -9,8 +9,11 @@ use std::{
 fn standalone_helper_hosts_a_lease() {
     let mut owner = Command::new("sleep").arg("60").spawn().unwrap();
     let lease = file_lease::FileLease::new(owner.id())
-        .with_keeper_executable(env!("CARGO_BIN_EXE_file-lease"));
-    let path = lease.materialize(b"public-cli-fixture", None).unwrap();
+        .with_helper_executable(env!("CARGO_BIN_EXE_file-lease"));
+    let path = lease
+        .materialize(b"public-cli-fixture")
+        .unwrap()
+        .into_path();
     assert_eq!(std::fs::read(&path).unwrap(), b"public-cli-fixture");
     lease.handoff().unwrap();
     drop(lease);
@@ -36,8 +39,11 @@ fn closed_standard_descriptors_child() {
         }
     }
     let lease = file_lease::FileLease::new(std::process::id())
-        .with_keeper_executable(env!("CARGO_BIN_EXE_file-lease"));
-    let path = lease.materialize(b"closed-stdio-fixture", None).unwrap();
+        .with_helper_executable(env!("CARGO_BIN_EXE_file-lease"));
+    let path = lease
+        .materialize(b"closed-stdio-fixture")
+        .unwrap()
+        .into_path();
     assert_eq!(std::fs::read(&path).unwrap(), b"closed-stdio-fixture");
     drop(lease);
     assert!(!path.exists());
