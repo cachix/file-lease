@@ -317,31 +317,22 @@ fn read_string(stream: &mut UnixStream, maximum: usize) -> io::Result<String> {
     String::from_utf8(bytes).map_err(io::Error::other)
 }
 
-// Keep path ownership beside each physical volume so release never guesses a
-// destination from an untrusted pathname. Keep at most one empty volume warm
-// for reuse; surplus empty volumes are detached when their last path is released.
+// Each backend tracks its own paths. Keep at most one empty volume warm for
+// reuse; surplus empty volumes are detached when their last path is released.
 #[derive(Default)]
 struct VolumeSet {
-    volumes: Vec<VolumeSlot>,
-}
-#[derive(Default)]
-struct VolumeSlot {
-    storage: Storage,
-    paths: HashSet<PathBuf>,
+    volumes: Vec<Storage>,
 }
 impl VolumeSet {
     fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
         for volume in &mut self.volumes {
-            match volume.storage.materialize(bytes, suffix) {
-                Ok(path) => {
-                    volume.paths.insert(path.clone());
-                    return Ok(path);
-                }
+            match volume.materialize(bytes, suffix) {
+                Ok(path) => return Ok(path),
                 Err(error) => {
                     // Only filesystem capacity exhaustion permits spillover.
                     // If an empty volume cannot fit the request, another fresh
                     // volume cannot help. This also bounds oversized retries.
-                    if error.raw_os_error() != Some(libc::ENOSPC) || volume.paths.is_empty() {
+                    if error.raw_os_error() != Some(libc::ENOSPC) || volume.is_empty() {
                         return Err(error);
                     }
                 }
@@ -349,27 +340,23 @@ impl VolumeSet {
         }
         // At most one new volume per request. Retain it even on failure, so a
         // later request can reuse it and final cleanup includes its journal.
-        self.volumes.push(VolumeSlot::default());
-        let volume = self.volumes.last_mut().unwrap();
-        let path = volume.storage.materialize(bytes, suffix)?;
-        volume.paths.insert(path.clone());
-        Ok(path)
+        self.volumes.push(Storage::default());
+        self.volumes.last_mut().unwrap().materialize(bytes, suffix)
     }
 
     fn release(&mut self, path: &Path) -> io::Result<()> {
         let index = self
             .volumes
             .iter()
-            .position(|volume| volume.paths.contains(path))
+            .position(|volume| volume.contains(path))
             .ok_or_else(|| io::Error::other("Unknown pooled path"))?;
         let volume = &mut self.volumes[index];
-        volume.storage.release(path)?;
-        volume.paths.remove(path);
-        if volume.paths.is_empty()
+        volume.release(path)?;
+        if volume.is_empty()
             && self
                 .volumes
                 .iter()
-                .filter(|volume| volume.paths.is_empty())
+                .filter(|volume| volume.is_empty())
                 .count()
                 > 1
         {
@@ -377,7 +364,7 @@ impl VolumeSet {
             // Payload revocation already succeeded. A failed detach remains
             // journaled for the guardian and later recovery; it must not turn
             // maintenance of an empty mount into revocation of live neighbours.
-            if empty.storage.cleanup().is_err() {
+            if empty.cleanup().is_err() {
                 eprintln!("File-lease empty-volume cleanup deferred to recovery");
             }
         }
@@ -388,10 +375,8 @@ impl VolumeSet {
         let mut failure = None;
         // A failure on one volume must not prevent revocation on the rest.
         for volume in &mut self.volumes {
-            if let Err(error) = volume.storage.cleanup() {
+            if let Err(error) = volume.cleanup() {
                 failure.get_or_insert(error);
-            } else {
-                volume.paths.clear();
             }
         }
         failure.map_or(Ok(()), Err)
@@ -695,10 +680,8 @@ mod tests {
         }
         assert_eq!(std::fs::read(&two).unwrap(), payload);
         assert_eq!(std::fs::read(&next).unwrap(), payload);
-        let mounts: Vec<_> = storage
-            .volumes
-            .iter()
-            .flat_map(|volume| volume.paths.iter())
+        let mounts: Vec<_> = [&two, &next]
+            .into_iter()
             .map(|path| path.parent().unwrap().to_owned())
             .collect();
         storage.cleanup().unwrap();
