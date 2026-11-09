@@ -18,9 +18,17 @@ pub(super) fn watch_owner(pid: u32) -> io::Result<OwnedFd> {
 pub(super) struct Storage {
     files: Vec<LockedFile>,
     next_fd: i32,
+    retired: Vec<i32>,
 }
 impl Storage {
     pub(super) fn materialize(&mut self, bytes: &[u8], _suffix: &str) -> io::Result<PathBuf> {
+        // Protect revoked numbers before creating either the memfd or its
+        // mapping reader. Moving only the final descriptor is too late: a
+        // reader could reopen an intermediate descriptor and retain the new
+        // file before its payload is written. Proc-fd sockets cannot be opened
+        // as files. Release these reservations when allocation finishes so
+        // revoked paths remain absent between operations.
+        let _reservations = self.reserve_retired()?;
         let mut file = anonymous_file(bytes)?;
         // Never reuse a revoked pathname for a later allocation in this helper.
         file.file = File::from(rustix::io::fcntl_dupfd_cloexec(
@@ -40,6 +48,29 @@ impl Storage {
         self.files.push(file);
         Ok(path)
     }
+
+    fn reserve_retired(&self) -> io::Result<Vec<OwnedFd>> {
+        if self.retired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholder: OwnedFd = std::os::unix::net::UnixDatagram::unbound()?.into();
+        let mut reservations = Vec::new();
+        for &fd in &self.retired {
+            // A watcher or the placeholder itself may already occupy a hole.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+                continue;
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
+                return Err(io::Error::last_os_error());
+            }
+            let reservation = rustix::io::fcntl_dupfd_cloexec(&placeholder, fd)?;
+            if reservation.as_raw_fd() == fd {
+                reservations.push(reservation);
+            }
+        }
+        reservations.push(placeholder);
+        Ok(reservations)
+    }
     pub(super) fn release(&mut self, path: &std::path::Path) -> io::Result<()> {
         let prefix = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
         let fd = path
@@ -52,10 +83,13 @@ impl Storage {
             .iter()
             .position(|file| Some(file.file.as_raw_fd()) == fd)
             .ok_or_else(|| io::Error::other("Path does not belong to this lease"))?;
+        self.retired.push(self.files[index].file.as_raw_fd());
         self.files.swap_remove(index);
         Ok(())
     }
     pub(super) fn cleanup(&mut self) -> io::Result<()> {
+        self.retired
+            .extend(self.files.iter().map(|file| file.file.as_raw_fd()));
         self.files.clear();
         Ok(())
     }
@@ -81,6 +115,8 @@ impl LockedMapping {
         // A read-only descriptor prevents VM_MAYWRITE on this shared mapping,
         // allowing F_SEAL_WRITE while the mapping remains locked and alive.
         let reader = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        #[cfg(test)]
+        tests::mapping_checkpoint();
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -146,6 +182,41 @@ fn anonymous_file(bytes: &[u8]) -> io::Result<LockedFile> {
 mod tests {
     use crate::FileLease;
     use std::{fs, process::Command};
+
+    thread_local! {
+        static MAPPING_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn mapping_checkpoint() {
+        MAPPING_HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+    }
+
+    #[test]
+    fn revoked_paths_cannot_capture_intermediate_allocation_descriptors() {
+        let mut storage = super::Storage::default();
+        let revoked = storage.materialize(b"original", "").unwrap();
+        storage.release(&revoked).unwrap();
+        assert!(!revoked.exists());
+        let old = revoked.clone();
+        // Reopen at the point where the new memfd's read-only descriptor is
+        // live, before its payload is written. Retaining that descriptor would
+        // expose the new bytes even after the helper moves its final handle.
+        MAPPING_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                assert!(fs::File::open(&old).is_err(), "revoked path reopened");
+            }));
+        });
+        let next = storage.materialize(b"new secret", "").unwrap();
+        MAPPING_HOOK.with_borrow_mut(|hook| *hook = None);
+        assert_ne!(revoked, next);
+        assert!(!revoked.exists());
+        assert_eq!(fs::read(next).unwrap(), b"new secret");
+    }
 
     fn page_size() -> usize {
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

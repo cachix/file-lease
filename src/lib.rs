@@ -293,6 +293,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_handoff_preserves_files_allocation_and_original_owner_watch() {
+        let mut owner = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut missing = Command::new("true").spawn().unwrap();
+        let missing_pid = missing.id();
+        missing.wait().unwrap();
+        let lease = FileLease::new(owner.id());
+        let first = lease.materialize(b"keep", None).unwrap();
+        assert!(lease.handoff_to(missing_pid).is_err());
+        assert_eq!(std::fs::read(&first).unwrap(), b"keep");
+        let second = lease.materialize(b"still allocating", None).unwrap();
+        lease.handoff().unwrap();
+        // A failed transfer must also preserve a previously handed-off lease.
+        assert!(lease.handoff_to(missing_pid).is_err());
+        drop(lease);
+        assert_eq!(std::fs::read(&first).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&second).unwrap(), b"still allocating");
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        revoked(&first);
+        revoked(&second);
+    }
+
+    #[test]
     fn killed_keeper_releases_storage_without_another_lease() {
         let lease = FileLease::new(std::process::id());
         let path = lease.materialize(b"crash-key", None).unwrap();

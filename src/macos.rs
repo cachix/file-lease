@@ -879,7 +879,7 @@ impl Storage {
             .counter
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Secret file namespace exhausted"))?;
-        let name = format!("secret-{}{suffix}", self.counter);
+        let name = format!("secret-{}-{suffix}", self.counter);
         let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
         let path = volume
             .journal
@@ -1145,6 +1145,27 @@ mod tests {
         storage.cleanup().unwrap();
         assert!(!existing.exists());
         assert!(!next.exists());
+    }
+
+    #[test]
+    fn numeric_suffixes_cannot_collide_with_later_file_counters() {
+        let mut storage = Storage::default();
+        let first = storage.materialize(b"original", "2").unwrap();
+        storage.release(&first).unwrap();
+        let mut paths = Vec::new();
+        // The released first name used to collide at counter 12; a live
+        // second name with suffix "2" used to collide at counter 22.
+        for counter in 2..=22 {
+            let suffix = if counter == 2 { "2" } else { "" };
+            let path = storage.materialize(b"later", suffix).unwrap();
+            assert_ne!(path, first);
+            assert!(!first.exists());
+            paths.push(path);
+        }
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), b"later");
+        }
+        storage.cleanup().unwrap();
     }
 
     fn unattached_journal(root: &Path) -> (tempfile::TempDir, Journal) {
