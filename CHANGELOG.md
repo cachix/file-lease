@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Fail the macOS shared volume manager closed when graceful scope cleanup
+  cannot revoke a path, allowing its guardian to recover the storage.
+
 - Recover macOS lease directories after a failed RAM disk attachment, and
   after another volume reuses a detached lease's disk number.
 
