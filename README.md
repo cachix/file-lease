@@ -360,16 +360,16 @@ with the guardian and existing orphan recovery handling volume cleanup. It is
 not enabled by default, and helpers must be built with the matching feature.
 Linux behavior is unchanged.
 
-A [native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42473073797)
+A [native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42591111094)
 used three alternating rounds, with 30 sequential joins and twelve concurrent
 joins per variant. Medians for overlapping independent leases were:
 
 | macOS 26 operation | Separate volumes | Shared volume |
 | --- | ---: | ---: |
-| Sequential join, including first file | 240.61 ms | 5.94 ms |
-| Independent sequential drop | 31.45 ms | 0.88 ms |
-| Concurrent join | 368.58 ms | 8.53 ms |
-| Initial cold setup | 262.05 ms | 253.91 ms |
+| Sequential join, including first file | 263.68 ms | 6.64 ms |
+| Independent sequential drop | 35.26 ms | 0.90 ms |
+| Concurrent join | 422.50 ms | 10.05 ms |
+| Initial cold setup | 253.39 ms | 302.57 ms |
 
 Each round created fifteen distinct volumes with the baseline and one with the
 prototype. Cold setup still attaches and formats a RAM disk and adds the manager
@@ -385,6 +385,23 @@ this harness against a fixed unpooled baseline on macOS 26 and macOS 15, and
 records both durations and the number of distinct volumes created. A separate
 24 MiB payload comparison forces spillover while checking cleanup and payload
 integrity. Run it locally with `-- --samples 3 --parallel 4 --payload-mib 24`.
+
+The same run tested spillover with 24 MiB payloads. One anchor, three sequential
+leases, and four overlapping concurrent leases created eight distinct volumes in
+the baseline and three in the pool. macOS 26 median sequential joins were
+287.10 ms versus 160.44 ms; concurrent joins were 1544.82 ms versus 565.95 ms.
+These are only three sequential and four concurrent samples per variant, run
+baseline first. macOS 15 concurrent joins were slower in the pool, 483.88 ms
+versus 441.08 ms, so this is diagnostic evidence rather than a general throughput
+claim. Pool allocation is serialized, and attempts on full volumes can write and
+remove a partial file before trying the next volume. Final teardown also includes
+every retained volume: the macOS 26 anchor drop took 182.26 ms for the pool versus
+49.34 ms for the baseline's remaining volume.
+
+Both macOS hosts passed 48 unit tests, three helper integration tests, and three
+documentation tests, including bounded oversized allocations, released-space
+reuse, cross-volume scope isolation and handoff, and orphan recovery after both
+volume guardians and the manager were killed. The feature remains opt-in.
 
 ## Development
 
