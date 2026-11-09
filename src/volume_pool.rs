@@ -317,8 +317,72 @@ fn read_string(stream: &mut UnixStream, maximum: usize) -> io::Result<String> {
     String::from_utf8(bytes).map_err(io::Error::other)
 }
 
-struct State {
+// Keep path ownership beside each physical volume so release never guesses a
+// destination from an untrusted pathname. Empty volumes stay warm until the
+// pool closes, and can satisfy later allocations without another attachment.
+#[derive(Default)]
+struct VolumeSet {
+    volumes: Vec<VolumeSlot>,
+}
+#[derive(Default)]
+struct VolumeSlot {
     storage: Storage,
+    paths: HashSet<PathBuf>,
+}
+impl VolumeSet {
+    fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
+        for volume in &mut self.volumes {
+            match volume.storage.materialize(bytes, suffix) {
+                Ok(path) => {
+                    volume.paths.insert(path.clone());
+                    return Ok(path);
+                }
+                Err(error) => {
+                    // Only filesystem capacity exhaustion permits spillover.
+                    // If an empty volume cannot fit the request, another fresh
+                    // volume cannot help. This also bounds oversized retries.
+                    if error.raw_os_error() != Some(libc::ENOSPC) || volume.paths.is_empty() {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        // At most one new volume per request. Retain it even on failure, so a
+        // later request can reuse it and final cleanup includes its journal.
+        self.volumes.push(VolumeSlot::default());
+        let volume = self.volumes.last_mut().unwrap();
+        let path = volume.storage.materialize(bytes, suffix)?;
+        volume.paths.insert(path.clone());
+        Ok(path)
+    }
+
+    fn release(&mut self, path: &Path) -> io::Result<()> {
+        let volume = self
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.paths.contains(path))
+            .ok_or_else(|| io::Error::other("Unknown pooled path"))?;
+        volume.storage.release(path)?;
+        volume.paths.remove(path);
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        let mut failure = None;
+        // A failure on one volume must not prevent revocation on the rest.
+        for volume in &mut self.volumes {
+            if let Err(error) = volume.storage.cleanup() {
+                failure.get_or_insert(error);
+            } else {
+                volume.paths.clear();
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+struct State {
+    storage: VolumeSet,
     active: usize,
     controller: bool,
 }
@@ -358,7 +422,7 @@ fn run(fd: &str) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let state = Arc::new(Mutex::new(State {
-        storage: Storage::default(),
+        storage: VolumeSet::default(),
         active: 0,
         controller: true,
     }));
@@ -546,9 +610,10 @@ mod tests {
         let pool = Pool::get(&std::env::current_exe().unwrap()).unwrap();
         let first = FileLease::new(std::process::id());
         let second = FileLease::new(std::process::id());
-        let one = first.materialize(b"scope-one", None).unwrap();
-        let two = second.materialize(b"scope-two", None).unwrap();
-        assert_eq!(one.parent(), two.parent());
+        let payload = vec![55; 40 * 1024 * 1024];
+        let one = first.materialize(&payload, None).unwrap();
+        let two = second.materialize(&payload, None).unwrap();
+        assert_ne!(one.parent(), two.parent());
         let first_pid = first.keeper.lock().unwrap().as_ref().unwrap().pid();
         assert_eq!(unsafe { libc::kill(first_pid as _, libc::SIGKILL) }, 0);
         drop(first);
@@ -557,11 +622,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!one.exists());
-        assert_eq!(std::fs::read(&two).unwrap(), b"scope-two");
+        assert_eq!(std::fs::read(&two).unwrap(), payload);
         let mut consumer = Command::new("sleep").arg("60").spawn().unwrap();
         second.handoff_to(consumer.id()).unwrap();
         drop(second);
-        assert_eq!(std::fs::read(&two).unwrap(), b"scope-two");
+        assert_eq!(std::fs::read(&two).unwrap(), payload);
         assert_eq!(unsafe { libc::kill(pool.pid() as _, 0) }, 0);
         consumer.kill().unwrap();
         consumer.wait().unwrap();
@@ -587,6 +652,63 @@ mod tests {
         second.cleanup().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"neighbour-fixture");
         first.cleanup().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spillover_reuses_freed_space_and_bounds_impossible_requests() {
+        let mut storage = VolumeSet::default();
+        let payload = vec![51; 40 * 1024 * 1024];
+        let one = storage.materialize(&payload, "").unwrap();
+        let two = storage.materialize(&payload, "").unwrap();
+        assert_ne!(one.parent(), two.parent());
+        assert_eq!(storage.volumes.len(), 2);
+        assert_eq!(std::fs::read(&one).unwrap(), payload);
+        assert_eq!(std::fs::read(&two).unwrap(), payload);
+        storage.release(&one).unwrap();
+        assert!(!one.exists());
+        let next = storage.materialize(&payload, "").unwrap();
+        assert_eq!(one.parent(), next.parent());
+        assert_eq!(storage.volumes.len(), 2);
+        let oversized = vec![52; MAX_BYTES as usize];
+        for _ in 0..2 {
+            let error = storage.materialize(&oversized, "").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            assert_eq!(storage.volumes.len(), 3);
+        }
+        assert_eq!(std::fs::read(&two).unwrap(), payload);
+        assert_eq!(std::fs::read(&next).unwrap(), payload);
+        let mounts: Vec<_> = storage
+            .volumes
+            .iter()
+            .flat_map(|volume| volume.paths.iter())
+            .map(|path| path.parent().unwrap().to_owned())
+            .collect();
+        storage.cleanup().unwrap();
+        assert!(mounts.iter().all(|mount| !mount.exists()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scopes_spanning_volumes_revoke_only_their_own_paths() {
+        let pool = Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let mut first = remote(&pool);
+        let mut second = remote(&pool);
+        let payload = vec![53; 40 * 1024 * 1024];
+        let one = first.materialize(&payload, "").unwrap();
+        let two = first.materialize(&payload, "").unwrap();
+        assert_ne!(one.parent(), two.parent());
+        let neighbour = second.materialize(b"neighbour", "").unwrap();
+        assert!(second.release(&two).is_err());
+        first.cleanup().unwrap();
+        assert!(!one.exists());
+        assert!(!two.exists());
+        assert_eq!(std::fs::read(&neighbour).unwrap(), b"neighbour");
+        let next = second.materialize(&payload, "").unwrap();
+        assert_eq!(one.parent(), next.parent());
+        assert_eq!(std::fs::read(&next).unwrap(), payload);
+        second.cleanup().unwrap();
+        assert!(!next.exists());
     }
 
     #[test]

@@ -337,7 +337,7 @@ would need a separate ownership and isolation design.
 
 ## Shared-volume prototype
 
-The experimental `shared-volumes` feature shares one macOS RAM volume across
+The experimental `shared-volumes` feature shares macOS RAM volumes across
 independent leases created by the same process and matching helper executable.
 Each lease retains its own helper, process-exit watcher, and private inherited
 channel to the volume manager. Paths belong to one scope: another scope cannot
@@ -346,7 +346,15 @@ helper and scope alive until its selected owner exits.
 
 The last scope and controller closing triggers volume teardown. There is no idle
 cache or installed service, so nonoverlapping leases still pay cold setup costs.
-The prototype shares a 64 MiB capacity budget and a volume-manager failure domain.
+Each physical volume has a 64 MiB capacity including filesystem overhead. When
+an allocation exhausts a populated volume, the manager tries the other volumes
+and creates at most one additional volume for that request. An allocation that
+cannot fit an empty volume fails without creating more volumes on retry. Only
+ENOSPC triggers spillover; other failures are returned. Released space is reused,
+and empty volumes remain attached until the pool closes. There is no fixed pool
+capacity limit, so peak RAM use scales with the number of volumes needed.
+
+The prototype retains a shared volume-manager failure domain.
 A lease helper crash revokes only its scope; a manager crash revokes all scopes,
 with the guardian and existing orphan recovery handling volume cleanup. It is
 not enabled by default, and helpers must be built with the matching feature.
@@ -368,13 +376,15 @@ prototype. Cold setup still attaches and formats a RAM disk and adds the manager
 process; this design accelerates reuse, not the first lease. All native isolation
 and recovery tests passed on macOS 26 and macOS 15. The opt-in prototype remains
 on [`perf/macos-shared-volume`](https://github.com/cachix/file-lease/tree/perf/macos-shared-volume)
-while shared-capacity and manager-failure tradeoffs are evaluated.
+while spillover and manager-failure tradeoffs are evaluated.
 
 `cargo run --locked --release --features shared-volumes --example
 shared_volume_timings` measures cold setup, sequential joins while an anchor lease
 remains live, concurrent joins, independent drops, and final teardown. CI compares
 this harness against a fixed unpooled baseline on macOS 26 and macOS 15, and
-records both durations and the number of distinct volumes created.
+records both durations and the number of distinct volumes created. A separate
+24 MiB payload comparison forces spillover while checking cleanup and payload
+integrity. Run it locally with `-- --samples 3 --parallel 4 --payload-mib 24`.
 
 ## Development
 

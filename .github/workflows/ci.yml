@@ -63,6 +63,11 @@ jobs:
               "$executable" --samples 10 --parallel 4 > "$results/ab/$variant-$round.csv"
             done
           done
+          mkdir -p "$results/spillover"
+          for variant in baseline pooled; do
+            if [[ "$variant" == baseline ]]; then executable="$baseline_bin"; else executable="$pooled_bin"; fi
+            "$executable" --samples 3 --parallel 4 --payload-mib 24 > "$results/spillover/$variant.csv"
+          done
       - name: Measure release latency and internal phases
         shell: bash
         run: |

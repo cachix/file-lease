@@ -59,3 +59,15 @@ for path in sorted((root / "ab").glob("*.csv")):
         rows = list(csv.DictReader(stream))
     if rows and "volumes" in rows[0]:
         print(f"# {path.name}: distinct_volumes={max(int(row['volumes']) for row in rows)}")
+
+# Large payloads force spillover. Keep these separate from small-file timings.
+groups = defaultdict(list)
+for path in sorted((root / "spillover").glob("*.csv")):
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        groups[f"spillover/{path.stem}/{row['mode']}/{row['operation']}"].append(float(row["elapsed_ms"]))
+    if rows:
+        print(f"# spillover/{path.name}: distinct_volumes={max(int(row['volumes']) for row in rows)}")
+if groups:
+    summarize(groups)

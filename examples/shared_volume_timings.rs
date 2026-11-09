@@ -13,11 +13,13 @@ fn main() -> std::io::Result<()> {
     }
     let mut samples = 10;
     let mut parallel = 4;
+    let mut payload_mib = 0;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let destination = match argument.as_str() {
             "--samples" => &mut samples,
             "--parallel" => &mut parallel,
+            "--payload-mib" => &mut payload_mib,
             _ => return Err(io::Error::other("Unknown overlap benchmark option")),
         };
         *destination = arguments
@@ -26,6 +28,14 @@ fn main() -> std::io::Result<()> {
             .filter(|value| (1..=1000).contains(value))
             .ok_or_else(|| io::Error::other("Benchmark counts must be between 1 and 1000"))?;
     }
+    if payload_mib > 40 {
+        return Err(io::Error::other("Payload must be at most 40 MiB"));
+    }
+    let payload_size = if payload_mib == 0 {
+        256
+    } else {
+        payload_mib * 1024 * 1024
+    };
     let make_lease = || {
         FileLease::new(std::process::id()).with_keeper_executable(std::env::current_exe().unwrap())
     };
@@ -33,25 +43,25 @@ fn main() -> std::io::Result<()> {
     println!("mode,sample,operation,index,elapsed_ms,volumes");
     let start = Instant::now();
     let anchor = make_lease();
-    let anchor_path = anchor.materialize(&[42; 256], None)?;
+    let anchor_path = anchor.materialize(&vec![42; payload_size], None)?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     volumes.insert(anchor_path.parent().unwrap().to_owned());
     println!("anchor,0,setup,0,{elapsed:.6},{}", volumes.len());
     for index in 0..samples {
         let start = Instant::now();
         let lease = make_lease();
-        let path = lease.materialize(&[43; 256], None)?;
+        let path = lease.materialize(&vec![43; payload_size], None)?;
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         volumes.insert(path.parent().unwrap().to_owned());
         println!("sequential,{index},join,0,{elapsed:.6},{}", volumes.len());
-        if std::fs::read(&path)? != [43; 256] {
+        if std::fs::read(&path)? != vec![43; payload_size] {
             return Err(io::Error::other("Incorrect overlap payload"));
         }
         let start = Instant::now();
         drop(lease);
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         println!("sequential,{index},drop,1,{elapsed:.6},{}", volumes.len());
-        if path.exists() || std::fs::read(&anchor_path)? != [42; 256] {
+        if path.exists() || std::fs::read(&anchor_path)? != vec![42; payload_size] {
             return Err(io::Error::other(
                 "Dropping an independent lease broke isolation",
             ));
@@ -66,7 +76,7 @@ fn main() -> std::io::Result<()> {
                 let start = Instant::now();
                 let lease = FileLease::new(std::process::id())
                     .with_keeper_executable(std::env::current_exe()?);
-                let path = lease.materialize(&[44; 256], None)?;
+                let path = lease.materialize(&vec![44; payload_size], None)?;
                 let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                 Ok((lease, path, elapsed))
             })
@@ -81,7 +91,7 @@ fn main() -> std::io::Result<()> {
         );
     }
     for (_, path, _) in &live {
-        if std::fs::read(path)? != [44; 256] {
+        if std::fs::read(path)? != vec![44; payload_size] {
             return Err(io::Error::other("Incorrect concurrent payload"));
         }
         volumes.insert(path.parent().unwrap().to_owned());
@@ -92,7 +102,7 @@ fn main() -> std::io::Result<()> {
         drop(lease);
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         println!("parallel,{index},drop,1,{elapsed:.6},{}", volumes.len());
-        if path.exists() || std::fs::read(&anchor_path)? != [42; 256] {
+        if path.exists() || std::fs::read(&anchor_path)? != vec![42; payload_size] {
             return Err(io::Error::other("Concurrent drop broke isolation"));
         }
     }

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Allow experimental macOS shared leases to spill into additional RAM volumes
+  when capacity is exhausted, reusing released space across leases.
+
 - Add an opt-in macOS shared-volume prototype for overlapping independent
   leases, retaining separate cleanup, process-exit revocation, and owner handoff
   within one process.

@@ -1484,20 +1484,35 @@ mod tests {
 
     #[cfg(feature = "shared-volumes")]
     #[test]
-    fn dead_shared_manager_and_guardian_leave_recoverable_metadata() {
+    fn dead_shared_manager_and_guardians_leave_all_volumes_recoverable() {
         let pool = crate::volume_pool::Pool::get(&std::env::current_exe().unwrap()).unwrap();
         let first = crate::FileLease::new(std::process::id());
         let second = crate::FileLease::new(std::process::id());
-        let (one, directory, id, guardian) = lease_state(&first);
-        let two = second.materialize(b"second-pool-scope", None).unwrap();
-        assert_eq!(one.parent(), two.parent());
-        assert_eq!(unsafe { libc::kill(guardian as _, libc::SIGKILL) }, 0);
+        let payload = vec![54; 40 * 1024 * 1024];
+        let one = first.materialize(&payload, None).unwrap();
+        let two = second.materialize(&payload, None).unwrap();
+        assert_ne!(one.parent(), two.parent());
+        let states: Vec<_> = [&one, &two]
+            .into_iter()
+            .map(|path| {
+                let directory = path.parent().unwrap().parent().unwrap().to_path_buf();
+                let id = Journal::read(&directory).unwrap().lease_id.unwrap();
+                let guardian: u32 = fs::read_to_string(directory.join("setup.ready"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(unsafe { libc::kill(guardian as _, libc::SIGKILL) }, 0);
+                (directory, id)
+            })
+            .collect();
         assert_eq!(unsafe { libc::kill(pool.pid() as _, libc::SIGKILL) }, 0);
         drop(first);
         drop(second);
         drop(pool);
         recover_orphans(&runtime_root().unwrap()).unwrap();
-        removed(&directory, id);
+        for (directory, id) in states {
+            removed(&directory, id);
+        }
         assert!(!one.exists());
         assert!(!two.exists());
     }
