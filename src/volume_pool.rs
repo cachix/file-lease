@@ -192,9 +192,7 @@ fn receive_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
         return Err(io::Error::other("Invalid volume scope registration"));
     }
     let descriptor = descriptors.pop().unwrap();
-    if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    helper::close_on_exec(descriptor.as_raw_fd())?;
     Ok(Some(descriptor))
 }
 
@@ -208,13 +206,8 @@ impl RemoteStorage {
             .map_err(io::Error::other)?
             .parse()
             .map_err(io::Error::other)?;
-        if fd < 3 {
-            return Err(io::Error::other("Invalid volume scope descriptor"));
-        }
-        let stream = unsafe { UnixStream::from_raw_fd(fd) };
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // The launcher transfers this private channel exclusively to the scope.
+        let stream = UnixStream::from(unsafe { helper::take_inherited(fd)? });
         Ok(Self {
             stream: Some(stream),
         })
@@ -362,13 +355,8 @@ pub(crate) fn maybe_run() -> Option<i32> {
 }
 fn run(fd: &str) -> io::Result<()> {
     let fd: i32 = fd.parse().map_err(io::Error::other)?;
-    if fd < 3 {
-        return Err(io::Error::other("Invalid volume control descriptor"));
-    }
-    let mut control = unsafe { UnixStream::from_raw_fd(fd) };
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // The launcher transfers this private channel exclusively to the manager.
+    let mut control = UnixStream::from(unsafe { helper::take_inherited(fd)? });
     // The manager handles payloads, so disable ordinary process core dumps.
     helper::disable_core_dumps()?;
     let state = Arc::new(Mutex::new(State {

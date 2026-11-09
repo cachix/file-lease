@@ -23,9 +23,7 @@ pub(super) fn watch_owner(pid: u32) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     let queue = unsafe { OwnedFd::from_raw_fd(fd) };
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    super::helper::close_on_exec(fd)?;
     let event = libc::kevent {
         ident: pid as _,
         filter: libc::EVFILT_PROC,
