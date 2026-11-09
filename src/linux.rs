@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, Write},
     os::fd::{AsRawFd, OwnedFd},
@@ -16,7 +17,7 @@ pub(super) fn watch_owner(pid: u32) -> io::Result<OwnedFd> {
 
 #[derive(Default)]
 pub(super) struct Storage {
-    files: Vec<LockedFile>,
+    files: HashMap<PathBuf, LockedFile>,
     next_fd: i32,
     retired: Vec<i32>,
 }
@@ -45,7 +46,7 @@ impl Storage {
             std::process::id(),
             file.file.as_raw_fd()
         ));
-        self.files.push(file);
+        self.files.insert(path.clone(), file);
         Ok(path)
     }
 
@@ -67,24 +68,27 @@ impl Storage {
         Ok(reservations)
     }
     pub(super) fn release(&mut self, path: &std::path::Path) -> io::Result<()> {
-        let prefix = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
-        let fd = path
-            .strip_prefix(prefix)
-            .ok()
-            .and_then(|p| p.to_str())
-            .and_then(|fd| fd.parse::<i32>().ok());
-        let index = self
+        let file = self
             .files
-            .iter()
-            .position(|file| Some(file.file.as_raw_fd()) == fd)
+            .remove(path)
             .ok_or_else(|| io::Error::other("Path does not belong to this lease"))?;
-        self.retired.push(self.files[index].file.as_raw_fd());
-        self.files.swap_remove(index);
+        self.retired.push(file.file.as_raw_fd());
         Ok(())
     }
+
+    #[cfg(all(test, feature = "shared-volumes"))]
+    pub(super) fn contains(&self, path: &std::path::Path) -> bool {
+        self.files.contains_key(path)
+    }
+
+    #[cfg(all(test, feature = "shared-volumes"))]
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     pub(super) fn cleanup(&mut self) -> io::Result<()> {
         self.retired
-            .extend(self.files.iter().map(|file| file.file.as_raw_fd()));
+            .extend(self.files.values().map(|file| file.file.as_raw_fd()));
         self.files.clear();
         Ok(())
     }

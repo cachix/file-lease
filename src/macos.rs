@@ -943,6 +943,17 @@ impl Storage {
         self.files.remove(path);
         Ok(())
     }
+
+    #[cfg(feature = "shared-volumes")]
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        self.files.contains(path)
+    }
+
+    #[cfg(feature = "shared-volumes")]
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     pub(super) fn cleanup(&mut self) -> io::Result<()> {
         if let Some(volume) = self.volume.take() {
             let _span = super::profiling::Span::new("storage.cleanup");
@@ -950,6 +961,7 @@ impl Storage {
             // keeper exits, and later leases remain a fallback if both die.
             cleanup_with_retry(&volume.directory)?;
         }
+        self.files.clear();
         Ok(())
     }
 }
