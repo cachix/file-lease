@@ -455,8 +455,13 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                 stream.read_exact(&mut pid)?;
                 let pid = u32::from_le_bytes(pid);
                 if pid != 0 {
-                    valid_pid(pid)?;
-                    let next = OwnerWatch::start(watch_owner(pid)?, storage.clone())?;
+                    let Ok(next) = valid_pid(pid)
+                        .and_then(|_| watch_owner(pid))
+                        .and_then(|watch| OwnerWatch::start(watch, storage.clone()))
+                    else {
+                        stream.write_all(&[0])?;
+                        continue;
+                    };
                     drop(owner_watch);
                     owner_watch = next;
                 }

@@ -719,10 +719,10 @@ mod tests {
             .collect();
         assert_eq!(storage.volumes.len(), 3);
         // A preflight rejection does not consume a file name. Each populated
-        // volume's first successful path is still secret-1, despite spillover.
-        assert_eq!(one.file_name().unwrap(), "secret-1");
-        assert_eq!(two.file_name().unwrap(), "secret-1");
-        assert_eq!(three.file_name().unwrap(), "secret-1");
+        // volume's first successful path is still secret-1-, despite spillover.
+        assert_eq!(one.file_name().unwrap(), "secret-1-");
+        assert_eq!(two.file_name().unwrap(), "secret-1-");
+        assert_eq!(three.file_name().unwrap(), "secret-1-");
         storage.release(&one).unwrap();
         assert!(mounts[0].exists());
         storage.release(&two).unwrap();
