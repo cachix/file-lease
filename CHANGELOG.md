@@ -2,13 +2,15 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-09
+
 - Stop searching PATH for the helper. Without `with_helper_executable`, the
   helper must be installed beside the current executable.
 
 - Check the helper's crate version and feature set during startup, rejecting
   mismatched helpers before sending payloads.
 
-- Prepare the 1.0 API. `materialize` returns a `LeasedFile` handle and takes
+- Establish the public API. `materialize` returns a `LeasedFile` handle and takes
   no suffix; use `materialize_with` and `FileOptions` for one. `release` takes
   a `LeasedFile`. Operations return a typed `Error` with an `ErrorKind`, which
   converts into `io::Error`. `maybe_run_keeper` and `with_keeper_executable`

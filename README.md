@@ -26,13 +26,13 @@ Requires Rust 1.92 or newer. Add the library to your application:
 
 ```toml
 [dependencies]
-file-lease = "1.0"
+file-lease = "0.1"
 ```
 
 Install the matching helper executable:
 
 ```sh
-cargo install file-lease --version 1.0.0 --locked
+cargo install file-lease --version 0.1.0 --locked
 ```
 
 Use the same version and feature configuration for the library and helper.
