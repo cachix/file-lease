@@ -332,8 +332,38 @@ concurrent leases with 240 additional files.
 These diagnostic samples show no startup improvement. Both candidates remain
 on [`perf/macos-attachment`](https://github.com/cachix/file-lease/tree/perf/macos-attachment)
 and its history; the default attachment behavior is unchanged. Reusing a lease
-amortizes volume creation today. Sharing a volume across independent leases
-would need a separate ownership and isolation design.
+amortizes volume creation today.
+
+### Shared-volume prototype
+
+The opt-in prototype on
+[`perf/macos-shared-volume`](https://github.com/cachix/file-lease/tree/perf/macos-shared-volume)
+shares a RAM volume among overlapping independent leases from one process and
+matching helper executable. Each lease keeps its own helper, owner watcher, and
+private inherited scope channel. Public `FileLease` methods are unchanged.
+
+A [repeated native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42473073797)
+used three alternating rounds, with thirty sequential joins and twelve concurrent
+joins per variant. Medians for 256-byte payloads were:
+
+| Operation | Separate volumes | Shared volume |
+| --- | ---: | ---: |
+| First file in a new lease while another lease stays live | 240.61 ms | 5.94 ms |
+| Independent lease drop | 31.45 ms | 0.88 ms |
+| Concurrent join | 368.58 ms | 8.53 ms |
+| Initial cold setup | 262.05 ms | 253.91 ms |
+
+Each round created fifteen distinct volumes with the baseline and one with the
+prototype. Cold setup still creates a RAM disk; there is no idle cache, and reuse
+requires overlapping leases. Native tests passed on macOS 26 and macOS 15,
+including distinct-owner exit, independent handoff, helper and manager crashes,
+orphan recovery, interrupted requests, cross-scope release rejection, and volume
+exhaustion.
+
+The prototype is not enabled on the default branch. It shares a 64 MiB capacity
+budget and a manager failure domain: a manager crash revokes every scope using
+that volume. Capacity spillover and this shared failure domain need review before
+adopting it as the default. See the prototype branch for usage and implementation.
 
 ## Shared-volume prototype
 
