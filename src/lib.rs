@@ -36,7 +36,7 @@ mod volume_pool;
 pub struct FileLease {
     owner: u32,
     executable: Option<PathBuf>,
-    keeper: Arc<Mutex<Option<Arc<platform::Keeper>>>>,
+    keeper: Arc<Mutex<Option<platform::Keeper>>>,
 }
 
 impl FileLease {
@@ -64,13 +64,13 @@ impl FileLease {
             .lock()
             .map_err(|_| io::Error::other("File lease lock poisoned"))?;
         if keeper.is_none() {
-            *keeper = Some(Arc::new(platform::Keeper::spawn(
+            *keeper = Some(platform::Keeper::spawn(
                 self.owner,
                 self.executable.as_deref(),
-            )?));
+            )?);
         }
         keeper
-            .as_ref()
+            .as_mut()
             .unwrap()
             .materialize(bytes, suffix.unwrap_or(""))
     }
@@ -82,7 +82,7 @@ impl FileLease {
             .keeper
             .lock()
             .map_err(|_| io::Error::other("File lease lock poisoned"))?
-            .as_ref()
+            .as_mut()
         {
             keeper.release(path)?;
         }
@@ -104,7 +104,7 @@ impl FileLease {
             .keeper
             .lock()
             .map_err(|_| io::Error::other("File lease lock poisoned"))?
-            .as_ref()
+            .as_mut()
         {
             keeper.handoff_to(owner)?;
         }
@@ -132,13 +132,13 @@ mod platform {
                 "Process-owned file delivery requires Linux or macOS",
             ))
         }
-        pub(super) fn materialize(&self, _: &[u8], _: &str) -> io::Result<PathBuf> {
+        pub(super) fn materialize(&mut self, _: &[u8], _: &str) -> io::Result<PathBuf> {
             unreachable!()
         }
-        pub(super) fn handoff_to(&self, _: Option<u32>) -> io::Result<()> {
+        pub(super) fn handoff_to(&mut self, _: Option<u32>) -> io::Result<()> {
             unreachable!()
         }
-        pub(super) fn release(&self, _: &Path) -> io::Result<()> {
+        pub(super) fn release(&mut self, _: &Path) -> io::Result<()> {
             unreachable!()
         }
     }
@@ -240,6 +240,42 @@ mod tests {
         }
         drop(lease);
         revoked(&path);
+    }
+
+    #[test]
+    fn concurrent_clones_share_files_until_the_last_clone_drops() {
+        use std::{sync::Barrier, thread};
+
+        let lease = FileLease::new(std::process::id());
+        let barrier = Arc::new(Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let lease = lease.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let path = lease.materialize(b"clone-payload", None).unwrap();
+                    (lease, path)
+                })
+            })
+            .collect();
+        let mut live: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let (last, last_path) = live.pop().unwrap();
+        let paths: Vec<_> = live.into_iter().map(|(_, path)| path).collect();
+        drop(lease);
+        for path in paths.iter().chain([&last_path]) {
+            assert_eq!(std::fs::read(path).unwrap(), b"clone-payload");
+        }
+        last.release(&paths[0]).unwrap();
+        assert!(!paths[0].exists());
+        assert_eq!(std::fs::read(&last_path).unwrap(), b"clone-payload");
+        drop(last);
+        for path in paths.iter().chain([&last_path]) {
+            revoked(path);
+        }
     }
 
     #[test]
