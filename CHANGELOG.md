@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Avoid known-full macOS shared volumes before writing payloads and reclaim
+  surplus empty volumes while retaining one for fast reuse.
+
 - Allow experimental macOS shared leases to spill into additional RAM volumes
   when capacity is exhausted, reusing released space across leases.
 

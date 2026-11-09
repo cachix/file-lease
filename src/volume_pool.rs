@@ -318,8 +318,8 @@ fn read_string(stream: &mut UnixStream, maximum: usize) -> io::Result<String> {
 }
 
 // Keep path ownership beside each physical volume so release never guesses a
-// destination from an untrusted pathname. Empty volumes stay warm until the
-// pool closes, and can satisfy later allocations without another attachment.
+// destination from an untrusted pathname. Keep at most one empty volume warm
+// for reuse; surplus empty volumes are detached when their last path is released.
 #[derive(Default)]
 struct VolumeSet {
     volumes: Vec<VolumeSlot>,
@@ -357,13 +357,30 @@ impl VolumeSet {
     }
 
     fn release(&mut self, path: &Path) -> io::Result<()> {
-        let volume = self
+        let index = self
             .volumes
-            .iter_mut()
-            .find(|volume| volume.paths.contains(path))
+            .iter()
+            .position(|volume| volume.paths.contains(path))
             .ok_or_else(|| io::Error::other("Unknown pooled path"))?;
+        let volume = &mut self.volumes[index];
         volume.storage.release(path)?;
         volume.paths.remove(path);
+        if volume.paths.is_empty()
+            && self
+                .volumes
+                .iter()
+                .filter(|volume| volume.paths.is_empty())
+                .count()
+                > 1
+        {
+            let mut empty = self.volumes.remove(index);
+            // Payload revocation already succeeded. A failed detach remains
+            // journaled for the guardian and later recovery; it must not turn
+            // maintenance of an empty mount into revocation of live neighbours.
+            if empty.storage.cleanup().is_err() {
+                eprintln!("File-lease empty-volume cleanup deferred to recovery");
+            }
+        }
         Ok(())
     }
 
@@ -684,6 +701,42 @@ mod tests {
             .flat_map(|volume| volume.paths.iter())
             .map(|path| path.parent().unwrap().to_owned())
             .collect();
+        storage.cleanup().unwrap();
+        assert!(mounts.iter().all(|mount| !mount.exists()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_volume_preflight_preserves_namespace_and_surplus_empty_volumes_detach() {
+        let mut storage = VolumeSet::default();
+        let payload = vec![56; 40 * 1024 * 1024];
+        let one = storage.materialize(&payload, "").unwrap();
+        let two = storage.materialize(&payload, "").unwrap();
+        let three = storage.materialize(&payload, "").unwrap();
+        let mounts: Vec<_> = [&one, &two, &three]
+            .into_iter()
+            .map(|path| path.parent().unwrap().to_owned())
+            .collect();
+        assert_eq!(storage.volumes.len(), 3);
+        // A preflight rejection does not consume a file name. Each populated
+        // volume's first successful path is still secret-1, despite spillover.
+        assert_eq!(one.file_name().unwrap(), "secret-1");
+        assert_eq!(two.file_name().unwrap(), "secret-1");
+        assert_eq!(three.file_name().unwrap(), "secret-1");
+        storage.release(&one).unwrap();
+        assert!(mounts[0].exists());
+        storage.release(&two).unwrap();
+        assert!(!mounts[1].exists());
+        assert_eq!(storage.volumes.len(), 2);
+        assert_eq!(std::fs::read(&three).unwrap(), payload);
+        let next = storage.materialize(&payload, "").unwrap();
+        assert_eq!(next.parent(), one.parent());
+        assert_eq!(storage.volumes.len(), 2);
+        assert!(storage.release(&two).is_err());
+        storage.release(&three).unwrap();
+        storage.release(&next).unwrap();
+        assert_eq!(storage.volumes.len(), 1);
+        assert_eq!(mounts.iter().filter(|mount| mount.exists()).count(), 1);
         storage.cleanup().unwrap();
         assert!(mounts.iter().all(|mount| !mount.exists()));
     }

@@ -66,7 +66,7 @@ for path in sorted((root / "spillover").glob("*.csv")):
     with path.open() as stream:
         rows = list(csv.DictReader(stream))
     for row in rows:
-        groups[f"spillover/{path.stem}/{row['mode']}/{row['operation']}"].append(float(row["elapsed_ms"]))
+        groups[f"spillover/{path.stem.split('-', 1)[0]}/{row['mode']}/{row['operation']}"].append(float(row["elapsed_ms"]))
     if rows:
         print(f"# spillover/{path.name}: distinct_volumes={max(int(row['volumes']) for row in rows)}")
 if groups:

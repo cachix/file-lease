@@ -351,7 +351,12 @@ an allocation exhausts a populated volume, the manager tries the other volumes
 and creates at most one additional volume for that request. An allocation that
 cannot fit an empty volume fails without creating more volumes on retry. Only
 ENOSPC triggers spillover; other failures are returned. Released space is reused,
-and empty volumes remain attached until the pool closes. There is no fixed pool
+and the pool keeps at most one empty volume attached for reuse. Surplus empty
+volumes are detached synchronously when their last path is released. Failed
+detaches remain journaled for recovery without revoking other scopes. The manager
+checks available space on the validated volume before creating a payload file;
+write errors remain authoritative if filesystem overhead still causes ENOSPC.
+There is no fixed pool
 capacity limit, so peak RAM use scales with the number of volumes needed.
 
 The prototype retains a shared volume-manager failure domain.

@@ -859,6 +859,21 @@ impl Storage {
         }
         let volume = self.volume.as_ref().unwrap();
         let root = volume.open_root()?;
+        #[cfg(feature = "shared-volumes")]
+        {
+            // Query the pinned, validated mount before opening a payload file.
+            // This rejects known-full volumes without writing partial payloads.
+            // Free space is only a preflight: metadata or other writers may
+            // still cause ENOSPC during the write, which remains authoritative.
+            let mut info = MaybeUninit::<libc::statfs>::zeroed();
+            if unsafe { libc::fstatfs(root.as_raw_fd(), info.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let info = unsafe { info.assume_init() };
+            if bytes.len() as u64 > info.f_bavail.saturating_mul(u64::from(info.f_bsize)) {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+        }
         let _span = super::profiling::Span::new("file.write");
         self.counter = self
             .counter
