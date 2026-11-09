@@ -1,5 +1,5 @@
 //! Payload allocation and revocation through a pinned, validated RAM mount.
-use super::{filesystem::unlink_payload, recovery::cleanup_with_retry, setup::Volume};
+use super::{recovery::cleanup_with_retry, setup::Volume, unlink_payload};
 use crate::profiling::Span;
 #[cfg(feature = "shared-volumes")]
 use rustix::fs::fstatfs;

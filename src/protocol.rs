@@ -81,80 +81,64 @@ pub(crate) fn write_ack(stream: &mut impl Write, success: bool) -> io::Result<()
     stream.write_all(&[u8::from(success)])
 }
 
-fn bounded_error<'a>(message: &'a str, fallback: &'a str) -> &'a str {
-    if message.len() <= MAX_MESSAGE_BYTES {
-        message
-    } else {
-        fallback
-    }
+/// The keeper reserves a string length for errors; volume scopes instead
+/// prefix every reply with a status byte. Both carry the same bounded strings.
+pub(crate) struct ReplyCodec {
+    error_marker: Option<u32>,
+    oversized_error: &'static str,
 }
 
-/// Lease helpers encode success as a path string and failure as a reserved
-/// length followed by an error string. Keep this distinct from scope replies.
-pub(crate) mod keeper_reply {
-    use super::*;
-
-    const ALLOCATION_ERROR: u32 = u32::MAX;
-
-    pub(crate) fn read(stream: &mut impl Read) -> io::Result<Result<String, String>> {
-        let mut length = [0; 4];
-        stream.read_exact(&mut length)?;
-        let length = u32::from_le_bytes(length);
-        if length == ALLOCATION_ERROR {
-            Ok(Err(read_string(stream, MAX_MESSAGE_BYTES)?))
-        } else {
-            Ok(Ok(read_string_body(
-                stream,
-                length as usize,
-                MAX_MESSAGE_BYTES,
-            )?))
-        }
-    }
-
-    pub(crate) fn write(stream: &mut impl Write, reply: Result<&str, &str>) -> io::Result<()> {
-        match reply {
-            Ok(path) => write_string(stream, path),
-            Err(message) => {
-                stream.write_all(&ALLOCATION_ERROR.to_le_bytes())?;
-                write_string(
-                    stream,
-                    bounded_error(
-                        message,
-                        "Secret storage allocation failed (oversized helper error)",
-                    ),
-                )
-            }
-        }
-    }
-}
-
-/// Volume scopes prefix both path and error strings with a status byte.
+pub(crate) const KEEPER_REPLY: ReplyCodec = ReplyCodec {
+    error_marker: Some(u32::MAX),
+    oversized_error: "Secret storage allocation failed (oversized helper error)",
+};
 #[cfg(all(
     feature = "shared-volumes",
     any(target_os = "macos", all(test, target_os = "linux"))
 ))]
-pub(crate) mod scope_reply {
-    use super::*;
+pub(crate) const SCOPE_REPLY: ReplyCodec = ReplyCodec {
+    error_marker: None,
+    oversized_error: "Volume allocation failed",
+};
 
-    pub(crate) fn read(stream: &mut impl Read) -> io::Result<Result<String, String>> {
-        let mut status = [0];
-        stream.read_exact(&mut status)?;
-        let message = read_string(stream, MAX_MESSAGE_BYTES)?;
-        Ok(if status == [1] {
-            Ok(message)
+impl ReplyCodec {
+    pub(crate) fn read(&self, stream: &mut impl Read) -> io::Result<Result<String, String>> {
+        let failed = if let Some(marker) = self.error_marker {
+            let mut length = [0; 4];
+            stream.read_exact(&mut length)?;
+            let length = u32::from_le_bytes(length);
+            if length != marker {
+                return read_string_body(stream, length as usize, MAX_MESSAGE_BYTES).map(Ok);
+            }
+            true
         } else {
-            Err(message)
-        })
+            let mut status = [0];
+            stream.read_exact(&mut status)?;
+            status != [1]
+        };
+        let message = read_string(stream, MAX_MESSAGE_BYTES)?;
+        Ok(if failed { Err(message) } else { Ok(message) })
     }
 
-    pub(crate) fn write(stream: &mut impl Write, reply: Result<&str, &str>) -> io::Result<()> {
-        write_ack(stream, reply.is_ok())?;
+    pub(crate) fn write(
+        &self,
+        stream: &mut impl Write,
+        reply: Result<&str, &str>,
+    ) -> io::Result<()> {
+        match (self.error_marker, reply.is_ok()) {
+            (Some(marker), false) => stream.write_all(&marker.to_le_bytes())?,
+            (None, success) => write_ack(stream, success)?,
+            _ => {}
+        }
         write_string(
             stream,
-            match reply {
-                Ok(path) => path,
-                Err(message) => bounded_error(message, "Volume allocation failed"),
-            },
+            reply.unwrap_or_else(|message| {
+                if message.len() <= MAX_MESSAGE_BYTES {
+                    message
+                } else {
+                    self.oversized_error
+                }
+            }),
         )
     }
 }
@@ -241,8 +225,8 @@ mod tests {
     #[test]
     fn keeper_reply_wire_format_and_error_boundaries() {
         check_reply_codec(
-            |stream| keeper_reply::read(stream),
-            keeper_reply::write,
+            |stream| KEEPER_REPLY.read(stream),
+            |stream, reply| KEEPER_REPLY.write(stream, reply),
             b"\x04\0\0\0/key",
             b"\xff\xff\xff\xff\x04\0\0\0full",
             "Secret storage allocation failed (oversized helper error)",
@@ -250,7 +234,7 @@ mod tests {
         for prefix in [&b""[..], &b"\xff\xff\xff\xff"[..]] {
             let mut frame = prefix.to_vec();
             frame.extend_from_slice(&(MAX_MESSAGE_BYTES as u32 + 1).to_le_bytes());
-            let error = keeper_reply::read(&mut &frame[..]).unwrap_err();
+            let error = KEEPER_REPLY.read(&mut &frame[..]).unwrap_err();
             assert_ne!(error.kind(), io::ErrorKind::UnexpectedEof);
         }
     }
@@ -259,8 +243,8 @@ mod tests {
     #[test]
     fn scope_reply_wire_format_and_error_boundaries() {
         check_reply_codec(
-            |stream| scope_reply::read(stream),
-            scope_reply::write,
+            |stream| SCOPE_REPLY.read(stream),
+            |stream, reply| SCOPE_REPLY.write(stream, reply),
             b"\x01\x04\0\0\0/key",
             b"\x00\x04\0\0\0full",
             "Volume allocation failed",
@@ -268,12 +252,12 @@ mod tests {
         for status in [0, 1] {
             let mut frame = vec![status];
             frame.extend_from_slice(&(MAX_MESSAGE_BYTES as u32 + 1).to_le_bytes());
-            let error = scope_reply::read(&mut &frame[..]).unwrap_err();
+            let error = SCOPE_REPLY.read(&mut &frame[..]).unwrap_err();
             assert_ne!(error.kind(), io::ErrorKind::UnexpectedEof);
         }
         // Preserve the existing rule that any non-success status is failure.
         assert_eq!(
-            scope_reply::read(&mut &b"\x02\x04\0\0\0full"[..]).unwrap(),
+            SCOPE_REPLY.read(&mut &b"\x02\x04\0\0\0full"[..]).unwrap(),
             Err("full".to_owned()),
         );
     }

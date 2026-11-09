@@ -1,14 +1,13 @@
 //! Native macOS storage, guardian, and crash-recovery regressions.
 use super::{
-    filesystem::{REQUIRED_MOUNT_FLAGS, validate_mount_flags},
-    journal::{Journal, device_identity},
+    REQUIRED_MOUNT_FLAGS, command, command_until,
     recovery::{
-        cleanup_directory, cleanup_with_retry, recover_orphans, recover_orphans_until,
-        retry_cleanup, runtime_root,
+        Journal, cleanup_directory, cleanup_with_retry, device_identity, recover_orphans,
+        recover_orphans_until, retry_cleanup, runtime_root,
     },
     setup::{Volume, record_attachment},
     storage::Storage,
-    tools::{command, command_until},
+    validate_mount_flags,
 };
 use crate::macos_registry as registry;
 use rustix::fs::statfs as mount_info;

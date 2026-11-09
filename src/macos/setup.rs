@@ -1,10 +1,8 @@
 //! RAM-volume provisioning and the independent setup guardian.
 use super::{
-    filesystem::validate_mount_flags,
-    journal::{Journal, device_identity},
-    process::{process_info, watch_owner},
-    recovery::{cleanup_with_retry, recover_orphans, runtime_root},
-    tools::{TOOL_TIMEOUT, command},
+    TOOL_TIMEOUT, command, process_info,
+    recovery::{Journal, cleanup_with_retry, device_identity, recover_orphans, runtime_root},
+    validate_mount_flags, watch_owner,
 };
 use crate::{command as tool_command, helper, macos_registry as registry, profiling::Span};
 use rustix::fs::statfs as mount_info;

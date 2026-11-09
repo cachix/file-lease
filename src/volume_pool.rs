@@ -6,8 +6,8 @@ use super::linux::Storage;
 #[cfg(target_os = "macos")]
 use super::macos::Storage;
 use super::protocol::{
-    ALLOCATE, CLOSE, MAX_MESSAGE_BYTES, RELEASE, read_ack, read_allocation, read_string,
-    scope_reply, write_ack, write_allocation, write_string,
+    ALLOCATE, CLOSE, MAX_MESSAGE_BYTES, RELEASE, SCOPE_REPLY, read_ack, read_allocation,
+    read_string, write_ack, write_allocation, write_string,
 };
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
@@ -208,7 +208,8 @@ impl RemoteStorage {
             .as_mut()
             .ok_or_else(|| io::Error::other("Volume scope closed"))?;
         write_allocation(stream, bytes, suffix)?;
-        scope_reply::read(stream)?
+        SCOPE_REPLY
+            .read(stream)?
             .map(PathBuf::from)
             .map_err(io::Error::other)
     }
@@ -380,7 +381,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                     match allocated {
                         Ok(path) => {
                             paths.insert(path.clone());
-                            scope_reply::write(
+                            SCOPE_REPLY.write(
                                 &mut stream,
                                 Ok(path
                                     .to_str()
@@ -388,7 +389,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                             )?;
                         }
                         Err(error) => {
-                            scope_reply::write(&mut stream, Err(&error.to_string()))?;
+                            SCOPE_REPLY.write(&mut stream, Err(&error.to_string()))?;
                         }
                     }
                 }

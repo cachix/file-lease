@@ -138,7 +138,7 @@ impl Keeper {
             return Err(io::Error::other("File lease has been handed off"));
         }
         protocol::write_allocation(stream, bytes, suffix)?;
-        let path = protocol::keeper_reply::read(stream)?.map_err(|message| {
+        let path = protocol::KEEPER_REPLY.read(stream)?.map_err(|message| {
             io::Error::other(format!(
                 "File keeper could not allocate secret storage: {message}"
             ))
@@ -291,11 +291,11 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                         let path = path
                             .to_str()
                             .ok_or_else(|| io::Error::other("Non-UTF-8 file lease path"))?;
-                        protocol::keeper_reply::write(&mut stream, Ok(path))?;
+                        protocol::KEEPER_REPLY.write(&mut stream, Ok(path))?;
                     }
                     Err(error) => {
                         eprintln!("file-lease storage: {error}");
-                        protocol::keeper_reply::write(&mut stream, Err(&error.to_string()))?;
+                        protocol::KEEPER_REPLY.write(&mut stream, Err(&error.to_string()))?;
                     }
                 }
             }
