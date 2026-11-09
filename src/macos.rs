@@ -298,8 +298,12 @@ impl Journal {
             if entry.file_type()?.is_file() {
                 let name = std::ffi::CString::new(entry.file_name().as_bytes())
                     .map_err(io::Error::other)?;
+                // A consumer may delete the name after it was listed.
                 if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-                    return Err(io::Error::last_os_error());
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ENOENT) {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -935,8 +939,14 @@ impl Storage {
             .filter(|name| name.components().count() == 1)
             .ok_or_else(|| io::Error::other("Invalid secret file path"))?;
         let name = std::ffi::CString::new(name.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        // Consumers own the volume's user and may delete a payload after
+        // reading it. The validated root rules out a missing mount, so a
+        // missing name is already revoked.
         if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
         }
         self.files.remove(path);
         Ok(())
@@ -1155,6 +1165,22 @@ mod tests {
         storage.cleanup().unwrap();
         assert!(!existing.exists());
         assert!(!next.exists());
+    }
+
+    #[test]
+    fn payloads_deleted_by_consumers_count_as_released() {
+        let mut storage = Storage::default();
+        let released = storage.materialize(b"released-fixture", "").unwrap();
+        let kept = storage.materialize(b"kept-fixture", "").unwrap();
+        let swept = storage.materialize(b"swept-fixture", "").unwrap();
+        fs::remove_file(&released).unwrap();
+        fs::remove_file(&swept).unwrap();
+        storage.release(&released).unwrap();
+        assert!(storage.release(&released).is_err());
+        assert_eq!(fs::read(&kept).unwrap(), b"kept-fixture");
+        let mount = kept.parent().unwrap().to_owned();
+        storage.cleanup().unwrap();
+        assert!(!mount.exists());
     }
 
     #[test]

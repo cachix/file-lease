@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Treat macOS payloads deleted by their consumers as released, so one deleted
+  file no longer stops the shared volume manager and revokes every other lease.
+
 - Share macOS RAM volumes across overlapping leases by default, with capacity
   spillover, independent file cleanup, and reclamation of surplus empty volumes.
   Disable default features to use separate volumes instead.
