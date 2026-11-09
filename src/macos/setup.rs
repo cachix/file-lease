@@ -118,7 +118,7 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     // worker while attachment is running. The tool retains the setup lock.
     journal.attachment_started = Some(true);
     journal.save(directory)?;
-    #[cfg(feature = "profiling")]
+    #[cfg(feature = "unstable-profiling")]
     let attach_span = Span::new("tool.attach");
     let attach = match attach.process_group(0).spawn() {
         Ok(attach) => attach,
@@ -136,7 +136,7 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     // conservative. Only a tool that exited by itself has a final outcome.
     let status = tool_command::wait_status(attach, TOOL_TIMEOUT)
         .map_err(|error| io::Error::new(error.kind(), format!("hdiutil attach: {error}")))?;
-    #[cfg(feature = "profiling")]
+    #[cfg(feature = "unstable-profiling")]
     drop(attach_span);
     record_attachment(&mut journal, directory, status)?;
     let mount = journal.mount.clone();

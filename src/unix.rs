@@ -1,6 +1,7 @@
 use super::helper::{self, above_stdio, reap_when_exited};
 use super::protocol::{self, ALLOCATE, CLOSE, HANDOFF, MAX_MESSAGE_BYTES, RELEASE};
 use super::*;
+use crate::error::{ErrorKind, tagged};
 use std::{
     io::{Read, Write},
     os::{
@@ -21,13 +22,13 @@ use super::volume_pool::RemoteStorage as Storage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
-// Version 2 requires locked Linux storage and framed allocation errors. Reject
-// older helpers before sending payloads rather than accepting pageable files.
+// Version 4 adds the build identity to the handshake. Reject older helpers
+// before sending payloads rather than accepting an unknown storage contract.
 #[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
-const READY: &[u8; 4] = b"SFL2";
+const READY: &[u8; 4] = b"SFL4";
 #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
 // Shared-volume helpers require a separate inherited scope channel.
-const READY: &[u8; 4] = b"SFL3";
+const READY: &[u8; 4] = b"SFL5";
 
 // FileLease owns this behind its shared mutex. Mutable access serializes the
 // request stream, handoff state, and child lifecycle together.
@@ -41,10 +42,20 @@ pub(super) struct Keeper {
 
 fn valid_pid(pid: u32) -> io::Result<()> {
     if pid == 0 || pid > i32::MAX as u32 {
-        Err(io::Error::other("Invalid file lease owner PID"))
+        Err(tagged(
+            ErrorKind::InvalidOwner,
+            "Invalid file lease owner PID",
+        ))
     } else {
         Ok(())
     }
+}
+
+fn invalid_owner(error: io::Error) -> io::Error {
+    tagged(
+        ErrorKind::InvalidOwner,
+        format!("Cannot watch file lease owner: {error}"),
+    )
 }
 
 impl Keeper {
@@ -57,11 +68,11 @@ impl Keeper {
         let _span = super::profiling::Span::new("lease.helper_spawn");
         valid_pid(owner)?;
         #[cfg(target_os = "macos")]
-        let owner_info = super::macos::process_info(owner)?;
+        let owner_info = super::macos::process_info(owner).map_err(invalid_owner)?;
         #[cfg(target_os = "macos")]
         let owner_arg = owner.to_string();
         #[cfg(target_os = "linux")]
-        let owner = above_stdio(watch_owner(owner)?)?;
+        let owner = above_stdio(watch_owner(owner).map_err(invalid_owner)?)?;
         let (stream, remote) = UnixStream::pair()?;
         let mut stream = above_stdio(stream)?;
         let remote = above_stdio(remote)?;
@@ -79,12 +90,19 @@ impl Keeper {
                 }
                 #[cfg(not(test))]
                 {
+                    // Never search PATH: every payload is sent to this process.
                     let sibling = std::env::current_exe()?.with_file_name("file-lease");
-                    if sibling.is_file() {
-                        sibling
-                    } else {
-                        PathBuf::from("file-lease")
+                    if !sibling.is_file() {
+                        return Err(tagged(
+                            ErrorKind::Helper,
+                            format!(
+                                "File lease helper not found at {}; install it there or \
+                                 call with_helper_executable",
+                                sibling.display()
+                            ),
+                        ));
                     }
+                    sibling
                 }
             }
         };
@@ -135,16 +153,21 @@ impl Keeper {
         let _span = super::profiling::Span::new("lease.allocate");
         let stream = &mut self.stream;
         if self.handed_off {
-            return Err(io::Error::other("File lease has been handed off"));
+            return Err(tagged(
+                ErrorKind::HandedOff,
+                "File lease has been handed off",
+            ));
         }
         protocol::write_allocation(stream, bytes, suffix)?;
         let path = protocol::KEEPER_REPLY.read(stream)?.map_err(|message| {
-            io::Error::other(format!(
-                "File keeper could not allocate secret storage: {message}"
-            ))
+            tagged(
+                ErrorKind::Storage,
+                format!("File keeper could not allocate secret storage: {message}"),
+            )
         })?;
         if path.is_empty() {
-            return Err(io::Error::other(
+            return Err(tagged(
+                ErrorKind::Storage,
                 "File keeper could not allocate secret storage",
             ));
         }
@@ -154,14 +177,14 @@ impl Keeper {
     pub(super) fn release(&mut self, path: &Path) -> io::Result<()> {
         let path = path
             .to_str()
-            .ok_or_else(|| io::Error::other("Non-UTF-8 lease path"))?;
-        if path.len() > MAX_MESSAGE_BYTES {
-            return Err(io::Error::other("Oversized lease path"));
-        }
+            .filter(|path| path.len() <= MAX_MESSAGE_BYTES)
+            .ok_or_else(|| tagged(ErrorKind::Release, "Path does not belong to this lease"))?;
         let stream = &mut self.stream;
         stream.write_all(&[RELEASE])?;
         protocol::write_string(stream, path)?;
-        protocol::read_ack(stream, "File lease release failed")
+        protocol::read_ack(stream, || {
+            tagged(ErrorKind::Release, "File lease release failed")
+        })
     }
 
     pub(super) fn handoff_to(&mut self, owner: Option<u32>) -> io::Result<()> {
@@ -172,7 +195,9 @@ impl Keeper {
         if !self.handed_off || owner.is_some() {
             stream.write_all(&[HANDOFF])?;
             stream.write_all(&owner.unwrap_or(0).to_le_bytes())?;
-            protocol::read_ack(stream, "File lease handoff failed")?;
+            protocol::read_ack(stream, || {
+                tagged(ErrorKind::Handoff, "File lease handoff failed")
+            })?;
             self.handed_off = true;
             #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
             self.pool.handoff();
@@ -260,7 +285,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
     let storage = Storage::default();
     let storage = Arc::new(Mutex::new(storage));
     let mut owner_watch = OwnerWatch::start(owner, storage.clone())?;
-    stream.write_all(READY)?;
+    helper::write_ready(&mut stream, READY)?;
     let mut handed_off = false;
     loop {
         let mut op = [0];

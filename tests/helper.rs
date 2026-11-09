@@ -9,8 +9,11 @@ use std::{
 fn standalone_helper_hosts_a_lease() {
     let mut owner = Command::new("sleep").arg("60").spawn().unwrap();
     let lease = file_lease::FileLease::new(owner.id())
-        .with_keeper_executable(env!("CARGO_BIN_EXE_file-lease"));
-    let path = lease.materialize(b"public-cli-fixture", None).unwrap();
+        .with_helper_executable(env!("CARGO_BIN_EXE_file-lease"));
+    let path = lease
+        .materialize(b"public-cli-fixture")
+        .unwrap()
+        .into_path();
     assert_eq!(std::fs::read(&path).unwrap(), b"public-cli-fixture");
     lease.handoff().unwrap();
     drop(lease);
@@ -36,8 +39,11 @@ fn closed_standard_descriptors_child() {
         }
     }
     let lease = file_lease::FileLease::new(std::process::id())
-        .with_keeper_executable(env!("CARGO_BIN_EXE_file-lease"));
-    let path = lease.materialize(b"closed-stdio-fixture", None).unwrap();
+        .with_helper_executable(env!("CARGO_BIN_EXE_file-lease"));
+    let path = lease
+        .materialize(b"closed-stdio-fixture")
+        .unwrap()
+        .into_path();
     assert_eq!(std::fs::read(&path).unwrap(), b"closed-stdio-fixture");
     drop(lease);
     assert!(!path.exists());
@@ -59,4 +65,46 @@ fn standalone_helper_works_with_closed_standard_descriptors() {
             .unwrap();
         assert!(status.success(), "closed descriptor mask {mask} failed");
     }
+}
+
+#[test]
+fn path_helper_child() {
+    let Some(marker) = std::env::var_os("FILE_LEASE_TEST_PATH_MARKER") else {
+        return;
+    };
+    let error = file_lease::FileLease::new(std::process::id())
+        .materialize(b"must-not-reach-path")
+        .unwrap_err();
+    assert_eq!(error.kind(), file_lease::ErrorKind::Helper, "{error}");
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "a helper was started from PATH"
+    );
+}
+
+#[test]
+fn missing_sibling_helper_is_not_replaced_from_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let sibling = std::env::current_exe()
+        .unwrap()
+        .with_file_name("file-lease");
+    assert!(
+        !sibling.exists(),
+        "unexpected helper at {}",
+        sibling.display()
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("started");
+    let fake = directory.path().join("file-lease");
+    // PATH holds only this directory, so record the start with a builtin.
+    std::fs::write(&fake, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "path_helper_child", "--nocapture"])
+        .env("PATH", directory.path())
+        .env("FILE_LEASE_TEST_PATH_MARKER", &marker)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!marker.exists(), "a helper was started from PATH");
 }

@@ -10,8 +10,8 @@ readme = "README.md"
 
 [features]
 default = ["shared-volumes"]
-# Internal diagnostics for synthetic benchmarks; disabled in ordinary builds.
-profiling = []
+# Internal diagnostics for synthetic benchmarks. Not covered by semver.
+unstable-profiling = []
 # Share macOS volumes across overlapping leases from one process.
 shared-volumes = []
 

@@ -4,6 +4,8 @@ use std::{ffi::OsString, io, path::PathBuf};
 ///
 /// This reports kernel metadata; the embedding application decides whether a
 /// shell, export caller, or detached manager should own its paths.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
 pub struct ProcessInfo {
     /// Process ID.
     pub pid: u32,
@@ -21,7 +23,11 @@ pub struct ProcessInfo {
 
 impl ProcessInfo {
     /// Inspect a process without invoking a shell or exposing its environment.
-    pub fn read(pid: u32) -> io::Result<Self> {
+    pub fn read(pid: u32) -> crate::Result<Self> {
+        Self::read_io(pid).map_err(|error| crate::Error::from_io(error, crate::ErrorKind::Io))
+    }
+
+    fn read_io(pid: u32) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStringExt;
@@ -155,8 +161,8 @@ impl ProcessInfo {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = pid;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
+            Err(crate::error::tagged(
+                crate::ErrorKind::Unsupported,
                 "File lease process inspection requires Linux or macOS",
             ))
         }

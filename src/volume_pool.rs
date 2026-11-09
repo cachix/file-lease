@@ -32,7 +32,7 @@ use std::{
 const CONTROL: &str = "_FILE_LEASE_VOLUME_CONTROL";
 #[cfg(target_os = "macos")]
 const CHANNEL: &str = "_FILE_LEASE_VOLUME_CHANNEL";
-const READY: &[u8; 4] = b"FLV1";
+const READY: &[u8; 4] = b"FLV2";
 // XNU installs every received right before copying control data to userspace.
 // Truncation can therefore leak descriptors whose numbers were never returned.
 // Cover XNU's UIPC_MAX_CMSG_FD bound, then reject extra rights after owning them.
@@ -97,7 +97,9 @@ impl Pool {
             .as_mut()
             .ok_or_else(|| io::Error::other("Volume pool closed"))?;
         send_fd(stream, local.as_fd())?;
-        read_ack(stream, "Volume scope registration failed")?;
+        read_ack(stream, || {
+            io::Error::other("Volume scope registration failed")
+        })?;
         Ok(remote.into())
     }
 
@@ -223,12 +225,16 @@ impl RemoteStorage {
             .ok_or_else(|| io::Error::other("Volume scope closed"))?;
         stream.write_all(&[RELEASE])?;
         write_string(stream, path)?;
-        read_ack(stream, "Path does not belong to this volume scope")
+        read_ack(stream, || {
+            io::Error::other("Path does not belong to this volume scope")
+        })
     }
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {
         if let Some(mut stream) = self.stream.take() {
             stream.write_all(&[CLOSE])?;
-            read_ack(&mut stream, "Volume scope cleanup failed")?;
+            read_ack(&mut stream, || {
+                io::Error::other("Volume scope cleanup failed")
+            })?;
         }
         Ok(())
     }
@@ -338,7 +344,7 @@ fn run(fd: &str) -> io::Result<()> {
         storage: VolumeSet::default(),
         connections: 1,
     }));
-    control.write_all(READY)?;
+    helper::write_ready(&mut control, READY)?;
     while let Some(channel) = receive_fd(&control)? {
         state
             .lock()
@@ -677,8 +683,8 @@ mod tests {
         let first = FileLease::new(std::process::id());
         let second = FileLease::new(std::process::id());
         let payload = vec![55; 40 * 1024 * 1024];
-        let one = first.materialize(&payload, None).unwrap();
-        let two = second.materialize(&payload, None).unwrap();
+        let one = first.materialize(&payload).unwrap().into_path();
+        let two = second.materialize(&payload).unwrap().into_path();
         assert_ne!(one.parent(), two.parent());
         let first_pid = first.keeper.lock().unwrap().as_ref().unwrap().pid();
         assert_eq!(unsafe { libc::kill(first_pid as _, libc::SIGKILL) }, 0);
@@ -861,10 +867,16 @@ mod tests {
     fn one_owners_exit_does_not_revoke_another_owners_scope() {
         use crate::FileLease;
         let anchor = FileLease::new(std::process::id());
-        let one = anchor.materialize(b"live-owner-fixture", None).unwrap();
+        let one = anchor
+            .materialize(b"live-owner-fixture")
+            .unwrap()
+            .into_path();
         let mut consumer = Command::new("sleep").arg("60").spawn().unwrap();
         let other = FileLease::new(consumer.id());
-        let two = other.materialize(b"exiting-owner-fixture", None).unwrap();
+        let two = other
+            .materialize(b"exiting-owner-fixture")
+            .unwrap()
+            .into_path();
         assert_eq!(one.parent(), two.parent());
         other.handoff().unwrap();
         consumer.kill().unwrap();
@@ -875,7 +887,10 @@ mod tests {
         }
         assert!(!two.exists());
         assert_eq!(std::fs::read(&one).unwrap(), b"live-owner-fixture");
-        let next = anchor.materialize(b"after-neighbour-exit", None).unwrap();
+        let next = anchor
+            .materialize(b"after-neighbour-exit")
+            .unwrap()
+            .into_path();
         assert_eq!(std::fs::read(&next).unwrap(), b"after-neighbour-exit");
         drop(other);
         drop(anchor);

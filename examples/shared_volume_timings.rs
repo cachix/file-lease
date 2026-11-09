@@ -8,7 +8,7 @@ fn main() -> std::io::Result<()> {
         sync::{Arc, Barrier},
         time::Instant,
     };
-    if let Some(code) = file_lease::maybe_run_keeper() {
+    if let Some(code) = file_lease::maybe_run_helper() {
         std::process::exit(code);
     }
     let mut samples = 10;
@@ -37,20 +37,20 @@ fn main() -> std::io::Result<()> {
         payload_mib * 1024 * 1024
     };
     let make_lease = || {
-        FileLease::new(std::process::id()).with_keeper_executable(std::env::current_exe().unwrap())
+        FileLease::new(std::process::id()).with_helper_executable(std::env::current_exe().unwrap())
     };
     let mut volumes = HashSet::new();
     println!("mode,sample,operation,index,elapsed_ms,volumes");
     let start = Instant::now();
     let anchor = make_lease();
-    let anchor_path = anchor.materialize(&vec![42; payload_size], None)?;
+    let anchor_path = anchor.materialize(&vec![42; payload_size])?.into_path();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     volumes.insert(anchor_path.parent().unwrap().to_owned());
     println!("anchor,0,setup,0,{elapsed:.6},{}", volumes.len());
     for index in 0..samples {
         let start = Instant::now();
         let lease = make_lease();
-        let path = lease.materialize(&vec![43; payload_size], None)?;
+        let path = lease.materialize(&vec![43; payload_size])?.into_path();
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         volumes.insert(path.parent().unwrap().to_owned());
         println!("sequential,{index},join,0,{elapsed:.6},{}", volumes.len());
@@ -75,8 +75,8 @@ fn main() -> std::io::Result<()> {
                 barrier.wait();
                 let start = Instant::now();
                 let lease = FileLease::new(std::process::id())
-                    .with_keeper_executable(std::env::current_exe()?);
-                let path = lease.materialize(&vec![44; payload_size], None)?;
+                    .with_helper_executable(std::env::current_exe()?);
+                let path = lease.materialize(&vec![44; payload_size])?.into_path();
                 let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                 Ok((lease, path, elapsed))
             })

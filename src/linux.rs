@@ -208,12 +208,12 @@ mod tests {
     #[test]
     fn lease_pages_are_locked_excluded_from_dumps_and_unlocked_on_release() {
         let lease = FileLease::new(std::process::id());
-        let first = lease.materialize(b"first", None).unwrap();
+        let first = lease.materialize(b"first").unwrap();
         let pid = keeper_pid(&lease);
         let page = page_size();
         assert_eq!(locked_bytes(pid), page);
         let bytes = vec![b'x'; page + 1];
-        let second = lease.materialize(&bytes, None).unwrap();
+        let second = lease.materialize(&bytes).unwrap();
         assert_eq!(fs::read(&second).unwrap(), bytes);
         assert_eq!(locked_bytes(pid), page * 3);
         let maps = fs::read_to_string(format!("/proc/{pid}/smaps")).unwrap();
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(locked_bytes(pid), page * 2);
         lease.release(&second).unwrap();
         assert_eq!(locked_bytes(pid), 0);
-        let empty = lease.materialize(b"", None).unwrap();
+        let empty = lease.materialize(b"").unwrap().into_path();
         assert!(fs::read(empty).unwrap().is_empty());
         assert_eq!(locked_bytes(pid), 0);
     }
@@ -265,24 +265,24 @@ mod tests {
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) }, 0);
         let lease = FileLease::new(std::process::id());
         if budget == 0 {
-            let error = lease
-                .materialize(b"must-not-be-pageable", None)
-                .unwrap_err();
+            let error = lease.materialize(b"must-not-be-pageable").unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Storage);
             assert!(error.to_string().contains("RLIMIT_MEMLOCK"), "{error}");
             // Failure must leave the helper usable and the reply stream aligned.
-            let empty = lease.materialize(b"", None).unwrap();
+            let empty = lease.materialize(b"").unwrap().into_path();
             assert!(fs::read(empty).unwrap().is_empty());
             assert_eq!(locked_bytes(keeper_pid(&lease)), 0);
         } else {
-            let first = lease.materialize(b"budget-fixture", None).unwrap();
+            let first = lease.materialize(b"budget-fixture").unwrap();
             let pid = keeper_pid(&lease);
-            let error = lease.materialize(b"over-budget", None).unwrap_err();
+            let error = lease.materialize(b"over-budget").unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Storage);
             assert!(error.to_string().contains("RLIMIT_MEMLOCK"), "{error}");
             assert_eq!(fs::read(&first).unwrap(), b"budget-fixture");
             assert_eq!(locked_bytes(pid), budget);
             lease.release(&first).unwrap();
             assert_eq!(locked_bytes(pid), 0);
-            let next = lease.materialize(b"reclaimed-budget", None).unwrap();
+            let next = lease.materialize(b"reclaimed-budget").unwrap();
             assert_ne!(first, next);
             assert_eq!(fs::read(&next).unwrap(), b"reclaimed-budget");
             lease.release(&next).unwrap();

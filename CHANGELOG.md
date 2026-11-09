@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- Stop searching PATH for the helper. Without `with_helper_executable`, the
+  helper must be installed beside the current executable.
+
+- Check the helper's crate version and feature set during startup, rejecting
+  mismatched helpers before sending payloads.
+
+- Prepare the 1.0 API. `materialize` returns a `LeasedFile` handle and takes
+  no suffix; use `materialize_with` and `FileOptions` for one. `release` takes
+  a `LeasedFile`. Operations return a typed `Error` with an `ErrorKind`, which
+  converts into `io::Error`. `maybe_run_keeper` and `with_keeper_executable`
+  are renamed to `maybe_run_helper` and `with_helper_executable`.
+  `ProcessInfo` is `#[non_exhaustive]` and implements `Clone` and `Debug`;
+  `FileLease` implements `Debug`. The `profiling` feature is renamed to
+  `unstable-profiling` and is not covered by semver.
+
 - Fail the macOS shared volume manager closed when graceful scope cleanup
   cannot revoke a path, allowing its guardian to recover the storage.
 

@@ -1,7 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    io,
+    ffi::OsStr,
+    fmt, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -31,11 +32,14 @@ mod volume_pool;
 
 /// A cloneable lease on memory-backed files.
 ///
-/// Clones share the same storage. By default,
-/// dropping the final owner releases files; call [`Self::handoff`] before
-/// exporting paths or exec to retain them until the consuming process exits.
-/// The matching `file-lease` executable must be installed alongside the host
-/// application or available on PATH. No host application helper hook is needed.
+/// Clones share the same storage. By default, dropping the final clone
+/// releases every file and waits for the helper to finish cleanup. Call
+/// [`Self::handoff`] before exporting paths or calling `exec` to retain them
+/// until the owner process exits.
+///
+/// The owner is identified by PID. Choose a process that is alive and stays
+/// alive while files are needed: if the PID exits and is reused before the
+/// first allocation, the helper watches the unrelated process instead.
 #[derive(Clone)]
 pub struct FileLease {
     owner: u32,
@@ -43,8 +47,72 @@ pub struct FileLease {
     keeper: Arc<Mutex<Option<platform::Keeper>>>,
 }
 
+impl fmt::Debug for FileLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileLease")
+            .field("owner", &self.owner)
+            .field("executable", &self.executable)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A file created by a [`FileLease`].
+///
+/// This is a name, not a lifetime: the file stays readable until it is
+/// released or its lease ends, whether or not this value is kept.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LeasedFile {
+    path: PathBuf,
+}
+
+impl LeasedFile {
+    /// The path consumers open.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Convert into the path consumers open.
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+
+impl AsRef<Path> for LeasedFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<OsStr> for LeasedFile {
+    fn as_ref(&self) -> &OsStr {
+        self.path.as_os_str()
+    }
+}
+
+/// Options for [`FileLease::materialize_with`].
+#[derive(Clone, Debug, Default)]
+pub struct FileOptions {
+    suffix: Option<String>,
+}
+
+impl FileOptions {
+    /// Default options: no suffix.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request a file name suffix such as `.pem`. macOS preserves it and
+    /// Linux omits it. See [`ErrorKind::InvalidSuffix`] for accepted values.
+    pub fn suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.suffix = Some(suffix.into());
+        self
+    }
+}
+
 impl FileLease {
-    /// Create a lease, lazily allocating resources on the first file secret.
+    /// Create a lease owned by `owner`. Resources are allocated lazily by
+    /// the first [`Self::materialize`] call, which also validates the owner.
     pub fn new(owner: u32) -> Self {
         Self {
             owner,
@@ -55,73 +123,77 @@ impl FileLease {
 
     /// Select a matching helper executable in an embedding application's
     /// deployment. Set this before cloning the lease.
-    pub fn with_keeper_executable(mut self, executable: impl Into<PathBuf>) -> Self {
+    pub fn with_helper_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.executable = Some(executable.into());
         self
     }
 
-    /// Materialize logical bytes, without creating an initial temporary file.
-    /// The optional suffix is a hint: macOS preserves it, Linux omits it.
-    pub fn materialize(&self, bytes: &[u8], suffix: Option<&str>) -> io::Result<PathBuf> {
-        let mut keeper = self
-            .keeper
-            .lock()
-            .map_err(|_| io::Error::other("File lease lock poisoned"))?;
+    /// Store `bytes` in a new read-only, memory-backed file.
+    pub fn materialize(&self, bytes: &[u8]) -> Result<LeasedFile> {
+        self.materialize_with(bytes, &FileOptions::default())
+    }
+
+    /// Store `bytes` in a new read-only, memory-backed file with `options`.
+    pub fn materialize_with(&self, bytes: &[u8], options: &FileOptions) -> Result<LeasedFile> {
+        let mut keeper = self.lock()?;
         if keeper.is_none() {
-            *keeper = Some(platform::Keeper::spawn(
-                self.owner,
-                self.executable.as_deref(),
-            )?);
+            *keeper = Some(
+                platform::Keeper::spawn(self.owner, self.executable.as_deref())
+                    .map_err(|error| Error::from_io(error, ErrorKind::Helper))?,
+            );
         }
-        keeper
+        let path = keeper
             .as_mut()
             .unwrap()
-            .materialize(bytes, suffix.unwrap_or(""))
+            .materialize(bytes, options.suffix.as_deref().unwrap_or(""))
+            .map_err(|error| Error::from_io(error, ErrorKind::Io))?;
+        Ok(LeasedFile { path })
     }
 
-    /// Revoke one path created by this lease without releasing its other files.
-    /// Existing readers may retain the contents until they close them.
-    pub fn release(&self, path: &Path) -> io::Result<()> {
-        if let Some(keeper) = self
-            .keeper
-            .lock()
-            .map_err(|_| io::Error::other("File lease lock poisoned"))?
+    /// Revoke one file created by this lease without releasing its other
+    /// files. Existing readers may retain the contents until they close them.
+    pub fn release(&self, file: &LeasedFile) -> Result<()> {
+        self.lock()?
             .as_mut()
-        {
-            keeper.release(path)?;
-        }
-        Ok(())
+            .ok_or_else(|| tagged(ErrorKind::Release, "Path does not belong to this lease"))
+            .and_then(|keeper| keeper.release(&file.path))
+            .map_err(|error| Error::from_io(error, ErrorKind::Io))
     }
 
-    /// Keep exported files until the original consuming process exits.
-    pub fn handoff(&self) -> io::Result<()> {
+    /// Keep existing files until the owner exits. After handoff, no clone can
+    /// allocate more files. Handing off an empty lease has no effect.
+    pub fn handoff(&self) -> Result<()> {
         self.handoff_inner(None)
     }
 
-    /// Transfer an existing lease to a detached manager or another consumer.
-    pub fn handoff_to(&self, owner: u32) -> io::Result<()> {
+    /// Transfer existing files to another live process, which then owns them.
+    pub fn handoff_to(&self, owner: u32) -> Result<()> {
         self.handoff_inner(Some(owner))
     }
 
-    fn handoff_inner(&self, owner: Option<u32>) -> io::Result<()> {
-        if let Some(keeper) = self
-            .keeper
-            .lock()
-            .map_err(|_| io::Error::other("File lease lock poisoned"))?
-            .as_mut()
-        {
-            keeper.handoff_to(owner)?;
+    fn handoff_inner(&self, owner: Option<u32>) -> Result<()> {
+        if let Some(keeper) = self.lock()?.as_mut() {
+            keeper
+                .handoff_to(owner)
+                .map_err(|error| Error::from_io(error, ErrorKind::Io))?;
         }
         Ok(())
     }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Option<platform::Keeper>>> {
+        self.keeper.lock().map_err(|_| {
+            Error::from_io(io::Error::other("File lease lock poisoned"), ErrorKind::Io)
+        })
+    }
 }
 
-/// Dispatch the internal helper protocol, returning `None` for ordinary invocations.
+/// Run the internal helper if this process was started as one.
 ///
-/// Call this before application argument parsing when hosting the helper in an
-/// existing executable, and exit with the returned status. Otherwise install the
-/// matching `file-lease` binary alongside the application or on PATH.
-pub fn maybe_run_keeper() -> Option<i32> {
+/// Returns `None` for ordinary invocations. Call this before application
+/// argument parsing when hosting the helper in an existing executable, and
+/// exit with the returned status. Otherwise install the matching `file-lease`
+/// binary alongside the application.
+pub fn maybe_run_helper() -> Option<i32> {
     platform::maybe_run_keeper()
 }
 
@@ -131,8 +203,8 @@ mod platform {
     pub(super) struct Keeper;
     impl Keeper {
         pub(super) fn spawn(_: u32, _: Option<&Path>) -> io::Result<Self> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
+            Err(tagged(
+                ErrorKind::Unsupported,
                 "Process-owned file delivery requires Linux or macOS",
             ))
         }
@@ -151,7 +223,10 @@ mod platform {
     }
 }
 
+mod error;
 mod process;
+use error::tagged;
+pub use error::{Error, ErrorKind, Result};
 pub use process::ProcessInfo;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -176,7 +251,7 @@ mod tests {
                 std::thread::park();
             }
         }
-        if let Some(code) = maybe_run_keeper() {
+        if let Some(code) = maybe_run_helper() {
             std::process::exit(code);
         }
     }
@@ -187,10 +262,11 @@ mod tests {
             return;
         }
         let error = FileLease::new(std::process::id())
-            .materialize(b"must-not-reach-old-helper", None)
+            .materialize(b"must-not-reach-old-helper")
             .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Helper);
         assert!(
-            error.to_string().contains("Incompatible file lease keeper"),
+            error.to_string().contains("Incompatible file lease helper"),
             "{error}"
         );
     }
@@ -223,7 +299,7 @@ mod tests {
     fn files_are_read_only_and_released_on_drop() {
         use std::os::unix::fs::PermissionsExt;
         let lease = FileLease::new(std::process::id());
-        let path = lease.materialize(b"public-test-key", None).unwrap();
+        let path = lease.materialize(b"public-test-key").unwrap().into_path();
         assert_eq!(std::fs::read(&path).unwrap(), b"public-test-key");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -258,8 +334,8 @@ mod tests {
                 let barrier = barrier.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    let path = lease.materialize(b"clone-payload", None).unwrap();
-                    (lease, path)
+                    let file = lease.materialize(b"clone-payload").unwrap();
+                    (lease, file)
                 })
             })
             .collect();
@@ -267,18 +343,18 @@ mod tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect();
-        let (last, last_path) = live.pop().unwrap();
-        let paths: Vec<_> = live.into_iter().map(|(_, path)| path).collect();
+        let (last, last_file) = live.pop().unwrap();
+        let files: Vec<_> = live.into_iter().map(|(_, file)| file).collect();
         drop(lease);
-        for path in paths.iter().chain([&last_path]) {
-            assert_eq!(std::fs::read(path).unwrap(), b"clone-payload");
+        for file in files.iter().chain([&last_file]) {
+            assert_eq!(std::fs::read(file).unwrap(), b"clone-payload");
         }
-        last.release(&paths[0]).unwrap();
-        assert!(!paths[0].exists());
-        assert_eq!(std::fs::read(&last_path).unwrap(), b"clone-payload");
+        last.release(&files[0]).unwrap();
+        assert!(!files[0].path().exists());
+        assert_eq!(std::fs::read(&last_file).unwrap(), b"clone-payload");
         drop(last);
-        for path in paths.iter().chain([&last_path]) {
-            revoked(path);
+        for file in files.iter().chain([&last_file]) {
+            revoked(file.path());
         }
     }
 
@@ -290,11 +366,14 @@ mod tests {
             .spawn()
             .unwrap();
         let lease = FileLease::new(owner.id());
-        let path = lease.materialize(b"leased-key", None).unwrap();
+        let path = lease.materialize(b"leased-key").unwrap().into_path();
         let reader = std::fs::File::open(&path).unwrap();
         lease.handoff().unwrap();
         lease.handoff().unwrap();
-        assert!(lease.materialize(b"too-late", None).is_err());
+        assert_eq!(
+            lease.materialize(b"too-late").unwrap_err().kind(),
+            ErrorKind::HandedOff
+        );
         drop(lease);
         assert_eq!(std::fs::read(&path).unwrap(), b"leased-key");
         owner.kill().unwrap();
@@ -308,7 +387,7 @@ mod tests {
         let mut launcher = Command::new("sleep").arg("60").spawn().unwrap();
         let mut daemon = Command::new("sleep").arg("60").spawn().unwrap();
         let lease = FileLease::new(launcher.id());
-        let path = lease.materialize(b"daemon-key", None).unwrap();
+        let path = lease.materialize(b"daemon-key").unwrap().into_path();
         lease.handoff().unwrap();
         lease.handoff_to(daemon.id()).unwrap();
         drop(lease);
@@ -324,8 +403,8 @@ mod tests {
     fn separate_leases_do_not_overwrite_or_revoke_each_other() {
         let first = FileLease::new(std::process::id());
         let second = FileLease::new(std::process::id());
-        let one = first.materialize(b"one", None).unwrap();
-        let two = second.materialize(b"two", None).unwrap();
+        let one = first.materialize(b"one").unwrap().into_path();
+        let two = second.materialize(b"two").unwrap().into_path();
         assert_ne!(one, two);
         drop(second);
         revoked(&two);
@@ -339,10 +418,13 @@ mod tests {
         let missing_pid = missing.id();
         missing.wait().unwrap();
         let lease = FileLease::new(owner.id());
-        let first = lease.materialize(b"keep", None).unwrap();
-        assert!(lease.handoff_to(missing_pid).is_err());
+        let first = lease.materialize(b"keep").unwrap().into_path();
+        assert_eq!(
+            lease.handoff_to(missing_pid).unwrap_err().kind(),
+            ErrorKind::Handoff
+        );
         assert_eq!(std::fs::read(&first).unwrap(), b"keep");
-        let second = lease.materialize(b"still allocating", None).unwrap();
+        let second = lease.materialize(b"still allocating").unwrap().into_path();
         lease.handoff().unwrap();
         // A failed transfer must also preserve a previously handed-off lease.
         assert!(lease.handoff_to(missing_pid).is_err());
@@ -358,7 +440,7 @@ mod tests {
     #[test]
     fn killed_keeper_releases_storage_without_another_lease() {
         let lease = FileLease::new(std::process::id());
-        let path = lease.materialize(b"crash-key", None).unwrap();
+        let path = lease.materialize(b"crash-key").unwrap().into_path();
         let pid = lease.keeper.lock().unwrap().as_ref().unwrap().pid();
         assert_eq!(unsafe { libc::kill(pid as _, libc::SIGKILL) }, 0);
         drop(lease);
@@ -366,31 +448,87 @@ mod tests {
     }
 
     #[test]
-    fn invalid_owners_and_suffixes_fail_closed() {
-        assert!(FileLease::new(0).materialize(b"key", None).is_err());
+    fn invalid_requests_fail_closed_with_typed_errors() {
+        let kind = |result: Result<LeasedFile>| result.unwrap_err().kind();
+        assert_eq!(
+            kind(FileLease::new(0).materialize(b"key")),
+            ErrorKind::InvalidOwner
+        );
+        let mut exited = Command::new("true").spawn().unwrap();
+        let exited_pid = exited.id();
+        exited.wait().unwrap();
+        assert_eq!(
+            kind(FileLease::new(exited_pid).materialize(b"key")),
+            ErrorKind::InvalidOwner
+        );
         let lease = FileLease::new(std::process::id());
-        assert!(lease.materialize(b"key", Some("/outside")).is_err());
+        assert_eq!(
+            kind(lease.materialize_with(b"key", &FileOptions::new().suffix("/outside"))),
+            ErrorKind::InvalidSuffix
+        );
+        let oversized = vec![0; protocol::MAX_SECRET_BYTES as usize + 1];
+        assert_eq!(kind(lease.materialize(&oversized)), ErrorKind::TooLarge);
+        assert_eq!(
+            kind(
+                FileLease::new(std::process::id())
+                    .with_helper_executable("/nonexistent/file-lease")
+                    .materialize(b"key")
+            ),
+            ErrorKind::Helper
+        );
+        // A rejected request leaves the helper usable.
+        lease.materialize(b"key").unwrap();
+    }
+
+    #[test]
+    fn errors_convert_into_io_errors() {
+        fn propagate() -> io::Result<LeasedFile> {
+            Ok(FileLease::new(0).materialize(b"key")?)
+        }
+        assert_eq!(propagate().unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn releasing_one_file_preserves_others_and_never_reuses_its_path() {
         let lease = FileLease::new(std::process::id());
-        let first = lease.materialize(b"first", Some(".pem")).unwrap();
-        let second = lease.materialize(b"second", Some(".der")).unwrap();
+        let first = lease
+            .materialize_with(b"first", &FileOptions::new().suffix(".pem"))
+            .unwrap();
+        let second = lease
+            .materialize_with(b"second", &FileOptions::new().suffix(".der"))
+            .unwrap();
         #[cfg(target_os = "linux")]
-        assert!(first.extension().is_none());
+        assert!(first.path().extension().is_none());
         #[cfg(target_os = "macos")]
-        assert_eq!(first.extension().unwrap(), "pem");
-        assert!(lease.release(Path::new("/not-a-lease-file")).is_err());
+        assert_eq!(first.path().extension().unwrap(), "pem");
+        // A file from another lease is not this lease's to revoke.
+        let other = FileLease::new(std::process::id());
+        let foreign = other.materialize(b"foreign").unwrap();
+        assert_eq!(
+            lease.release(&foreign).unwrap_err().kind(),
+            ErrorKind::Release
+        );
+        assert_eq!(
+            FileLease::new(std::process::id())
+                .release(&foreign)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Release
+        );
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
         lease.release(&first).unwrap();
-        assert!(!first.exists());
+        assert!(!first.path().exists());
+        assert_eq!(
+            lease.release(&first).unwrap_err().kind(),
+            ErrorKind::Release
+        );
         assert_eq!(std::fs::read(&second).unwrap(), b"second");
-        let third = lease.materialize(b"third", None).unwrap();
+        let third = lease.materialize(b"third").unwrap();
         assert_ne!(first, third);
-        assert!(!first.exists());
+        assert!(!first.path().exists());
         drop(lease);
-        revoked(&second);
-        revoked(&third);
+        revoked(second.path());
+        revoked(third.path());
     }
 
     #[test]

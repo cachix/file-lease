@@ -6,13 +6,13 @@ fn sample(files: usize) -> std::io::Result<Vec<(&'static str, f64)>> {
     use std::{io, time::Instant};
 
     let start = Instant::now();
-    let lease = FileLease::new(std::process::id()).with_keeper_executable(std::env::current_exe()?);
-    let first = lease.materialize(&[42; 256], None)?;
+    let lease = FileLease::new(std::process::id()).with_helper_executable(std::env::current_exe()?);
+    let first = lease.materialize(&[42; 256])?.into_path();
     let mut timings = vec![("setup", start.elapsed().as_secs_f64() * 1000.0)];
     let mut paths = vec![first];
     for _ in 0..files {
         let start = Instant::now();
-        paths.push(lease.materialize(&[42; 256], None)?);
+        paths.push(lease.materialize(&[42; 256])?.into_path());
         timings.push(("additional_file", start.elapsed().as_secs_f64() * 1000.0));
     }
     // Verify outside the allocation timers, and retain every file until cleanup.
@@ -34,7 +34,7 @@ fn sample(files: usize) -> std::io::Result<Vec<(&'static str, f64)>> {
 fn main() -> std::io::Result<()> {
     use std::sync::{Arc, Barrier};
 
-    if let Some(code) = file_lease::maybe_run_keeper() {
+    if let Some(code) = file_lease::maybe_run_helper() {
         std::process::exit(code);
     }
     let mut samples = 10;

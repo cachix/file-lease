@@ -1,7 +1,7 @@
 //! Opt-in metadata-only timings. Ordinary builds compile these guards away.
 
 pub(crate) struct Span {
-    #[cfg(feature = "profiling")]
+    #[cfg(feature = "unstable-profiling")]
     timing: Option<(&'static str, std::time::Instant)>,
 }
 
@@ -9,13 +9,13 @@ impl Span {
     #[inline]
     pub(crate) fn new(_phase: &'static str) -> Self {
         Self {
-            #[cfg(feature = "profiling")]
+            #[cfg(feature = "unstable-profiling")]
             timing: directory().map(|_| (_phase, std::time::Instant::now())),
         }
     }
 }
 
-#[cfg(feature = "profiling")]
+#[cfg(feature = "unstable-profiling")]
 fn directory() -> Option<&'static std::path::PathBuf> {
     static DIRECTORY: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIRECTORY
@@ -23,7 +23,7 @@ fn directory() -> Option<&'static std::path::PathBuf> {
         .as_ref()
 }
 
-#[cfg(feature = "profiling")]
+#[cfg(feature = "unstable-profiling")]
 impl Drop for Span {
     fn drop(&mut self) {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};

@@ -15,7 +15,7 @@ additional files per lease. Override counts with `-- --samples 20 --files 50
 --parallel 4`. Compilation is outside the timers. These are diagnostic timings,
 not performance thresholds or measurements of the RAM disk's memory footprint.
 
-For internal phase timings, build with `--features profiling` and set
+For internal phase timings, build with `--features unstable-profiling` and set
 `_FILE_LEASE_PROFILE_DIR` to an existing private directory. Each process appends
 CSV records containing only a fixed phase name, PID, and elapsed microseconds.
 This optional feature is disabled by default and never records payloads or

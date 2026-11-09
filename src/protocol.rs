@@ -1,5 +1,6 @@
 //! Framing shared by the lease helper and volume manager.
 
+use crate::error::{ErrorKind, tagged};
 use std::io::{self, Read, Write};
 use zeroize::Zeroizing;
 
@@ -17,7 +18,10 @@ fn validate_suffix(suffix: &str) -> io::Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
     {
-        return Err(io::Error::other("Invalid secret file suffix"));
+        return Err(tagged(
+            ErrorKind::InvalidSuffix,
+            "Invalid secret file suffix",
+        ));
     }
     Ok(())
 }
@@ -29,7 +33,10 @@ pub(crate) fn write_allocation(
 ) -> io::Result<()> {
     // Validate the entire request before writing any part of its frame.
     if bytes.len() as u64 > MAX_SECRET_BYTES {
-        return Err(io::Error::other("Secret exceeds file lease size limit"));
+        return Err(tagged(
+            ErrorKind::TooLarge,
+            "Secret exceeds file lease size limit",
+        ));
     }
     validate_suffix(suffix)?;
     stream.write_all(&[ALLOCATE])?;
@@ -44,7 +51,10 @@ pub(crate) fn read_allocation(stream: &mut impl Read) -> io::Result<(Zeroizing<V
     stream.read_exact(&mut length)?;
     let length = u64::from_le_bytes(length);
     if length > MAX_SECRET_BYTES {
-        return Err(io::Error::other("Secret exceeds file lease size limit"));
+        return Err(tagged(
+            ErrorKind::TooLarge,
+            "Secret exceeds file lease size limit",
+        ));
     }
     let suffix = read_string(stream, MAX_SUFFIX_BYTES)?;
     validate_suffix(&suffix)?;
@@ -67,14 +77,14 @@ pub(crate) fn read_string(stream: &mut impl Read, maximum: usize) -> io::Result<
     read_string_body(stream, u32::from_le_bytes(length) as usize, maximum)
 }
 
-pub(crate) fn read_ack(stream: &mut impl Read, failure: &'static str) -> io::Result<()> {
+/// Read an acknowledgement, building the error for a refusal.
+pub(crate) fn read_ack(
+    stream: &mut impl Read,
+    refused: impl FnOnce() -> io::Error,
+) -> io::Result<()> {
     let mut ack = [0];
     stream.read_exact(&mut ack)?;
-    if ack == [1] {
-        Ok(())
-    } else {
-        Err(io::Error::other(failure))
-    }
+    if ack == [1] { Ok(()) } else { Err(refused()) }
 }
 
 pub(crate) fn write_ack(stream: &mut impl Write, success: bool) -> io::Result<()> {
@@ -269,21 +279,21 @@ mod tests {
         write_ack(&mut frame, false).unwrap();
         assert_eq!(frame, [1, 0]);
         let mut incoming = &frame[..];
-        read_ack(&mut incoming, "release failed").unwrap();
+        read_ack(&mut incoming, || io::Error::other("release failed")).unwrap();
         assert_eq!(
-            read_ack(&mut incoming, "release failed")
+            read_ack(&mut incoming, || io::Error::other("release failed"))
                 .unwrap_err()
                 .to_string(),
             "release failed"
         );
         assert_eq!(
-            read_ack(&mut incoming, "release failed")
+            read_ack(&mut incoming, || io::Error::other("release failed"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
         for status in [2, 255] {
-            assert!(read_ack(&mut &[status][..], "release failed").is_err());
+            assert!(read_ack(&mut &[status][..], || io::Error::other("release failed")).is_err());
         }
     }
 
