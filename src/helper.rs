@@ -1,7 +1,7 @@
 //! Process lifecycle shared by the lease helper and volume manager.
 
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
@@ -101,46 +101,39 @@ fn spawn_with_timeout(
     Ok(child)
 }
 
+/// Identifies the build on both sides of a handshake. The wire protocol and
+/// recovery format are internal, so only an identical build is compatible.
+#[cfg(feature = "shared-volumes")]
+const BUILD: &str = concat!("file-lease ", env!("CARGO_PKG_VERSION"), " shared-volumes");
+#[cfg(not(feature = "shared-volumes"))]
+const BUILD: &str = concat!("file-lease ", env!("CARGO_PKG_VERSION"));
+
+/// Announce readiness: the protocol tag, then this build's identity.
+pub(crate) fn write_ready(stream: &mut impl Write, tag: &[u8; 4]) -> io::Result<()> {
+    let mut ready = tag.to_vec();
+    ready.push(BUILD.len() as u8);
+    ready.extend_from_slice(BUILD.as_bytes());
+    stream.write_all(&ready)
+}
+
 fn read_ready(stream: &mut UnixStream, expected: &[u8; 4], timeout: Duration) -> io::Result<()> {
     let previous_timeout = stream.read_timeout()?;
     let deadline = Instant::now() + timeout;
     let handshake = (|| {
-        let mut ready = [0; 4];
-        let mut received = 0;
-        while received < ready.len() {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(startup_timeout)?;
-            set_read_timeout(stream, Some(remaining))?;
-            match stream.read(&mut ready[received..]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "File lease keeper exited before readiness",
-                    ));
-                }
-                Ok(count) => received += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(startup_timeout());
-                }
-                Err(error) => return Err(error),
-            }
+        // Check the tag before reading further: older helpers send only a tag.
+        let mut tag = [0; 4];
+        read_until(stream, &mut tag, deadline)?;
+        if &tag != expected {
+            return Err(incompatible(&String::from_utf8_lossy(&tag)));
         }
-        if &ready == expected {
-            Ok(())
-        } else {
-            Err(crate::error::tagged(
-                crate::error::ErrorKind::Helper,
-                "Incompatible file lease keeper",
-            ))
+        let mut length = [0];
+        read_until(stream, &mut length, deadline)?;
+        let mut build = vec![0; length[0].into()];
+        read_until(stream, &mut build, deadline)?;
+        if build != BUILD.as_bytes() {
+            return Err(incompatible(&String::from_utf8_lossy(&build)));
         }
+        Ok(())
     })();
     // Startup's timeout must not change subsequent allocation or cleanup IO.
     let restored = set_read_timeout(stream, previous_timeout);
@@ -156,6 +149,44 @@ fn set_read_timeout(stream: &UnixStream, timeout: Option<Duration>) -> io::Resul
         }
         result => result,
     }
+}
+
+fn incompatible(found: &str) -> io::Error {
+    crate::error::tagged(
+        crate::error::ErrorKind::Helper,
+        format!("Incompatible file lease helper: expected {BUILD}, found {found:?}"),
+    )
+}
+
+fn read_until(stream: &mut UnixStream, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut received = 0;
+    while received < buffer.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(startup_timeout)?;
+        set_read_timeout(stream, Some(remaining))?;
+        match stream.read(&mut buffer[received..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "File lease keeper exited before readiness",
+                ));
+            }
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(startup_timeout());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn startup_timeout() -> io::Error {
@@ -258,12 +289,30 @@ mod tests {
     #[test]
     fn successful_readiness_restores_the_socket_timeout() {
         let (mut stream, mut peer) = UnixStream::pair().unwrap();
-        peer.write_all(b"TESTnext").unwrap();
+        write_ready(&mut peer, b"TEST").unwrap();
+        peer.write_all(b"next").unwrap();
         read_ready(&mut stream, b"TEST", Duration::from_secs(2)).unwrap();
         assert_eq!(stream.read_timeout().unwrap(), None);
         let mut next = [0; 4];
         stream.read_exact(&mut next).unwrap();
         assert_eq!(&next, b"next");
+    }
+
+    #[test]
+    fn other_protocols_and_builds_are_incompatible() {
+        let mut other_build = b"TEST".to_vec();
+        other_build.push(16);
+        other_build.extend_from_slice(b"file-lease 0.0.0");
+        // An older helper sends only its tag and then waits for requests.
+        for ready in [&b"OLD!"[..], &other_build] {
+            let (mut stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(ready).unwrap();
+            let error = read_ready(&mut stream, b"TEST", Duration::from_secs(2)).unwrap_err();
+            assert_eq!(
+                crate::Error::from_io(error, crate::ErrorKind::Io).kind(),
+                crate::ErrorKind::Helper
+            );
+        }
     }
 
     #[test]

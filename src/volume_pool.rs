@@ -32,7 +32,7 @@ use std::{
 const CONTROL: &str = "_FILE_LEASE_VOLUME_CONTROL";
 #[cfg(target_os = "macos")]
 const CHANNEL: &str = "_FILE_LEASE_VOLUME_CHANNEL";
-const READY: &[u8; 4] = b"FLV1";
+const READY: &[u8; 4] = b"FLV2";
 // XNU installs every received right before copying control data to userspace.
 // Truncation can therefore leak descriptors whose numbers were never returned.
 // Cover XNU's UIPC_MAX_CMSG_FD bound, then reject extra rights after owning them.
@@ -344,7 +344,7 @@ fn run(fd: &str) -> io::Result<()> {
         storage: VolumeSet::default(),
         connections: 1,
     }));
-    control.write_all(READY)?;
+    helper::write_ready(&mut control, READY)?;
     while let Some(channel) = receive_fd(&control)? {
         state
             .lock()

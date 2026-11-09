@@ -266,7 +266,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Helper);
         assert!(
-            error.to_string().contains("Incompatible file lease keeper"),
+            error.to_string().contains("Incompatible file lease helper"),
             "{error}"
         );
     }

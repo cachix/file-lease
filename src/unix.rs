@@ -22,13 +22,13 @@ use super::volume_pool::RemoteStorage as Storage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
-// Version 2 requires locked Linux storage and framed allocation errors. Reject
-// older helpers before sending payloads rather than accepting pageable files.
+// Version 4 adds the build identity to the handshake. Reject older helpers
+// before sending payloads rather than accepting an unknown storage contract.
 #[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
-const READY: &[u8; 4] = b"SFL2";
+const READY: &[u8; 4] = b"SFL4";
 #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
 // Shared-volume helpers require a separate inherited scope channel.
-const READY: &[u8; 4] = b"SFL3";
+const READY: &[u8; 4] = b"SFL5";
 
 // FileLease owns this behind its shared mutex. Mutable access serializes the
 // request stream, handoff state, and child lifecycle together.
@@ -90,12 +90,19 @@ impl Keeper {
                 }
                 #[cfg(not(test))]
                 {
+                    // Never search PATH: every payload is sent to this process.
                     let sibling = std::env::current_exe()?.with_file_name("file-lease");
-                    if sibling.is_file() {
-                        sibling
-                    } else {
-                        PathBuf::from("file-lease")
+                    if !sibling.is_file() {
+                        return Err(tagged(
+                            ErrorKind::Helper,
+                            format!(
+                                "File lease helper not found at {}; install it there or \
+                                 call with_helper_executable",
+                                sibling.display()
+                            ),
+                        ));
                     }
+                    sibling
                 }
             }
         };
@@ -278,7 +285,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
     let storage = Storage::default();
     let storage = Arc::new(Mutex::new(storage));
     let mut owner_watch = OwnerWatch::start(owner, storage.clone())?;
-    stream.write_all(READY)?;
+    helper::write_ready(&mut stream, READY)?;
     let mut handed_off = false;
     loop {
         let mut op = [0];
