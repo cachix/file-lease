@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Fail the macOS shared volume manager closed when graceful scope cleanup
+  cannot revoke a path, allowing its guardian to recover the storage.
+
 - Treat macOS payloads deleted by their consumers as released, so one deleted
   file no longer stops the shared volume manager and revokes every other lease.
 

@@ -389,11 +389,11 @@ fn run(fd: &str) -> io::Result<()> {
 fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
     let mut stream = UnixStream::from(channel);
     let mut paths = HashSet::new();
-    let result = (|| -> io::Result<()> {
+    let close_requested = (|| -> io::Result<bool> {
         loop {
             let mut op = [0];
             match stream.read_exact(&mut op) {
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
                 result => result?,
             }
             match op[0] {
@@ -442,11 +442,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                     }
                     stream.write_all(&[u8::from(released)])?;
                 }
-                CLOSE => {
-                    cleanup_paths(&mut paths, &state)?;
-                    stream.write_all(&[1])?;
-                    return Ok(());
-                }
+                CLOSE => return Ok(true),
                 _ => return Err(io::Error::other("Invalid volume operation")),
             }
         }
@@ -457,7 +453,9 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
         // manager closed. Its guardian recovers the volume after process exit.
         std::process::exit(1);
     }
-    let _ = result;
+    if matches!(close_requested, Ok(true)) {
+        let _ = stream.write_all(&[1]);
+    }
     if let Ok(mut state) = state.lock() {
         disconnect(&mut state);
     } else {
@@ -525,8 +523,7 @@ mod tests {
     fn scope_cleanup_revokes_every_path_despite_one_failure() {
         let state = Mutex::new(State {
             storage: VolumeSet::default(),
-            active: 1,
-            controller: true,
+            connections: 2,
         });
         let path = state
             .lock()
@@ -566,6 +563,42 @@ mod tests {
         second.cleanup().unwrap();
         assert!(!neighbour.exists());
         assert!(!next.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_graceful_cleanup_exits_the_manager() {
+        use std::time::{Duration, Instant};
+        use wait_timeout::ChildExt;
+
+        let pool = Pool::get(&std::env::current_exe().unwrap()).unwrap();
+        let mut first = remote(&pool);
+        let mut second = remote(&pool);
+        let blocked = first.materialize(b"blocked-cleanup", "").unwrap();
+        let neighbour = second.materialize(b"neighbour", "").unwrap();
+        // A directory in place of a payload makes unlinkat fail, unlike an
+        // already-deleted payload, which is considered successfully revoked.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(first.cleanup().is_err());
+        let mut guard = pool.child.lock().unwrap();
+        let child = guard.as_mut().unwrap();
+        let status = child.wait_timeout(Duration::from_secs(10)).unwrap();
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(
+            !status
+                .expect("Manager survived a scope cleanup failure")
+                .success()
+        );
+        // The guardian recovers storage after the manager fails closed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while neighbour.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!neighbour.exists());
     }
 
     #[test]
