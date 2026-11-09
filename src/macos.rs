@@ -818,7 +818,7 @@ impl Volume {
                 if let Ok(ready) = fs::read_to_string(directory.join("setup.ready"))
                     && let Ok(pid) = ready.parse::<u32>()
                 {
-                    super::platform::reap_when_exited(worker);
+                    super::helper::reap_when_exited(worker);
                     if pid == 0 {
                         return Err(io::Error::other("RAM-disk setup failed"));
                     }
