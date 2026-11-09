@@ -56,13 +56,8 @@ impl Storage {
         let placeholder: OwnedFd = std::os::unix::net::UnixDatagram::unbound()?.into();
         let mut reservations = Vec::new();
         for &fd in &self.retired {
-            // A watcher or the placeholder itself may already occupy a hole.
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
-                continue;
-            }
-            if io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
-                return Err(io::Error::last_os_error());
-            }
+            // Duplication fills the lowest free slot at or above fd. If a
+            // watcher or the placeholder already occupies it, discard the copy.
             let reservation = rustix::io::fcntl_dupfd_cloexec(&placeholder, fd)?;
             if reservation.as_raw_fd() == fd {
                 reservations.push(reservation);
@@ -184,14 +179,14 @@ mod tests {
     use std::{fs, process::Command};
 
     thread_local! {
-        static MAPPING_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        static REVOKED_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
             const { std::cell::RefCell::new(None) };
     }
 
     pub(super) fn mapping_checkpoint() {
-        MAPPING_HOOK.with_borrow_mut(|hook| {
-            if let Some(hook) = hook {
-                hook();
+        REVOKED_PATH.with_borrow(|path| {
+            if let Some(path) = path {
+                assert!(fs::File::open(path).is_err(), "revoked path reopened");
             }
         });
     }
@@ -202,17 +197,12 @@ mod tests {
         let revoked = storage.materialize(b"original", "").unwrap();
         storage.release(&revoked).unwrap();
         assert!(!revoked.exists());
-        let old = revoked.clone();
         // Reopen at the point where the new memfd's read-only descriptor is
         // live, before its payload is written. Retaining that descriptor would
         // expose the new bytes even after the helper moves its final handle.
-        MAPPING_HOOK.with_borrow_mut(|hook| {
-            *hook = Some(Box::new(move || {
-                assert!(fs::File::open(&old).is_err(), "revoked path reopened");
-            }));
-        });
+        REVOKED_PATH.with_borrow_mut(|path| *path = Some(revoked.clone()));
         let next = storage.materialize(b"new secret", "").unwrap();
-        MAPPING_HOOK.with_borrow_mut(|hook| *hook = None);
+        REVOKED_PATH.with_borrow_mut(|path| *path = None);
         assert_ne!(revoked, next);
         assert!(!revoked.exists());
         assert_eq!(fs::read(next).unwrap(), b"new secret");
