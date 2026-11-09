@@ -398,8 +398,8 @@ the baseline and three in the pool. macOS 26 median sequential joins were
 These are only three sequential and four concurrent samples per variant, run
 baseline first. macOS 15 concurrent joins were slower in the pool, 483.88 ms
 versus 441.08 ms, so this is diagnostic evidence rather than a general throughput
-claim. Pool allocation is serialized, and attempts on full volumes can write and
-remove a partial file before trying the next volume. Final teardown also includes
+claim. That version serialized allocation and could write and remove a partial
+file on a full volume before trying the next volume. Its final teardown included
 every retained volume: the macOS 26 anchor drop took 182.26 ms for the pool versus
 49.34 ms for the baseline's remaining volume.
 
@@ -407,6 +407,29 @@ Both macOS hosts passed 48 unit tests, three helper integration tests, and three
 documentation tests, including bounded oversized allocations, released-space
 reuse, cross-volume scope isolation and handoff, and orphan recovery after both
 volume guardians and the manager were killed. The feature remains opt-in.
+
+A [follow-up native comparison](https://github.com/cachix/file-lease/actions/runs/42592834712)
+tested free-space preflight and reclaiming surplus empty volumes against that
+previous pool (`f42cf6d`) and the same separate-volume baseline. Each variant ran
+in three rotating-order rounds on the same runner. macOS 26 medians were:
+
+| Operation | Previous pool | Preflight and reclamation |
+| --- | ---: | ---: |
+| Small-file sequential join (30 samples) | 4.36 ms | 4.32 ms |
+| 24 MiB sequential join (9 samples) | 134.41 ms | 102.47 ms |
+| 24 MiB concurrent join (12 samples) | 563.42 ms | 413.98 ms |
+| Final anchor drop (3 samples) | 101.35 ms | 63.86 ms |
+
+Reclamation moves some detach latency into individual drops. For the 24 MiB
+concurrent workload, median drop latency was 1.87 ms versus 2.03 ms, but p95
+increased from 2.06 ms to 40.45 ms when a surplus volume was detached. Both pools
+created three distinct volumes per round; the new policy retains at most one
+empty volume instead of every volume until shutdown. On macOS 15, concurrent
+joins improved from 418.86 ms to 353.05 ms. These synthetic samples establish the
+tradeoff for this workload, not a general throughput or memory-footprint claim.
+Both macOS hosts passed 49 unit tests, three helper integration tests, and three
+documentation tests. Linux CI also passed. The public API and opt-in status are
+unchanged.
 
 ## Development
 
