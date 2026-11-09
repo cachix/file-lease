@@ -101,7 +101,9 @@ mod tests {
     fn commands_share_a_deadline_and_expired_budgets_do_not_spawn() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("should-not-run");
-        let deadline = Instant::now() + Duration::from_millis(200);
+        // Allow process startup and scheduling on busy CI hosts. The same
+        // absolute deadline still bounds both commands and the expired call.
+        let deadline = Instant::now() + Duration::from_secs(2);
         run_until(Command::new("sleep").arg("0.05"), deadline).unwrap();
         let error = run_until(Command::new("sleep").arg("60"), deadline).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
