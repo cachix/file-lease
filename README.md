@@ -6,7 +6,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/cachix/file-lease/blob/main/LICENSE)
 [![Rust: 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://github.com/cachix/file-lease/blob/main/Cargo.toml)
 
-**Memory-backed files with ordinary paths and process-owned lifetimes.**
+**Memory-backed files for secrets, with automatic cleanup tied to a process.**
 
 Linux uses sealed `memfd` files with locked memory, exposed through
 `/proc/<helper-pid>/fd/<fd>`. macOS uses private HFS RAM disks that provide
