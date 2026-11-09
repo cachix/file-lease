@@ -8,6 +8,8 @@ use std::{
 
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 mod command;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod helper;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

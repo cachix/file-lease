@@ -1,12 +1,13 @@
+use super::helper::{self, above_stdio, reap_when_exited};
 use super::protocol::{self, ALLOCATE, CLOSE, HANDOFF, MAX_MESSAGE_BYTES, RELEASE};
 use super::*;
 use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::net::UnixStream,
     },
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
 };
 
 #[cfg(target_os = "linux")]
@@ -45,19 +46,6 @@ fn valid_pid(pid: u32) -> io::Result<()> {
     } else {
         Ok(())
     }
-}
-
-// Descriptors inherited through exec must not collide with child stdio setup.
-pub(crate) fn above_stdio<T: Into<OwnedFd> + From<OwnedFd>>(descriptor: T) -> io::Result<T> {
-    let descriptor = descriptor.into();
-    if descriptor.as_raw_fd() >= 3 {
-        return Ok(descriptor.into());
-    }
-    let duplicate = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) }.into())
 }
 
 impl Keeper {
@@ -113,11 +101,7 @@ impl Keeper {
         );
         command
             .env(SOCKET_ENV, socket_fd.to_string())
-            .env(OWNER_ENV, owner_arg)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
+            .env(OWNER_ENV, owner_arg);
         #[cfg(target_os = "macos")]
         command.env(
             "_FILE_LEASE_OWNER_BIRTH",
@@ -129,44 +113,16 @@ impl Keeper {
         // kqueues are not inherited across fork. macOS registers its exit
         // watcher inside the new helper and validates the process birth time.
         #[cfg(target_os = "linux")]
-        let inherited = vec![socket_fd, owner_fd];
+        let inherited = vec![remote.into(), owner];
         #[cfg(target_os = "macos")]
-        let inherited = vec![socket_fd];
+        let inherited = vec![remote.into()];
         #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
         let inherited = {
             let mut descriptors = inherited;
-            descriptors.push(volume_channel.as_raw_fd());
+            descriptors.push(volume_channel);
             descriptors
         };
-        unsafe {
-            command.pre_exec(move || {
-                for fd in &inherited {
-                    if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-        #[cfg(test)]
-        command
-            .args(["--exact", "tests::keeper_entry", "--nocapture"])
-            .stderr(Stdio::inherit());
-        let mut child = command.spawn()?;
-        drop(remote);
-        #[cfg(target_os = "linux")]
-        drop(owner);
-        let mut ready = [0; 4];
-        if let Err(error) = stream.read_exact(&mut ready) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        if &ready != READY {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::other("Incompatible file lease keeper"));
-        }
+        let child = helper::spawn(&mut command, inherited, &mut stream, READY)?;
         Ok(Self {
             stream,
             child: Some(child),
@@ -326,17 +282,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
         verify()?;
         watch
     };
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    limit.rlim_cur = 0;
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    helper::disable_core_dumps()?;
     #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
     let storage = Storage::from_env()?;
     #[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
@@ -484,24 +430,4 @@ impl Drop for OwnerWatch {
             let _ = thread.join();
         }
     }
-}
-pub(super) fn reap_when_exited(child: Child) {
-    use std::sync::{OnceLock, mpsc};
-    static REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
-    let sender = REAPER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<Child>();
-        std::thread::spawn(move || {
-            let mut children = Vec::new();
-            loop {
-                match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(child) => children.push(child),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-                children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-            }
-        });
-        sender
-    });
-    let _ = sender.send(child);
 }

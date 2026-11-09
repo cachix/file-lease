@@ -14,7 +14,7 @@ pub(super) fn terminate(mut child: Child) {
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let _ = child.kill();
     // Do not turn a timeout into an unbounded wait for an unresponsive child.
-    super::platform::reap_when_exited(child);
+    super::helper::reap_when_exited(child);
 }
 
 pub(super) fn run(command: &mut Command, timeout: Duration) -> io::Result<()> {

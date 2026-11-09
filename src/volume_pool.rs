@@ -1,5 +1,6 @@
 //! Inherited-channel macOS volume manager. The public lease protocol and
 //! owner watchers remain in each individual lease helper.
+use super::helper;
 #[cfg(target_os = "linux")]
 use super::linux::Storage;
 #[cfg(target_os = "macos")]
@@ -13,10 +14,10 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::net::UnixStream,
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
@@ -56,39 +57,14 @@ impl Pool {
             }
         }
         let (mut control, remote) = UnixStream::pair()?;
-        let remote = super::platform::above_stdio(remote)?;
+        let remote = helper::above_stdio(remote)?;
         let fd = remote.as_raw_fd();
         let mut command = Command::new(executable);
         command
             .env(CONTROL, fd.to_string())
             // Old test helpers use this descriptor to advertise their version.
-            .env("_FILE_LEASE_KEEPER_SOCKET", fd.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        #[cfg(test)]
-        command
-            .args(["--exact", "tests::keeper_entry", "--nocapture"])
-            .stderr(Stdio::inherit());
-        let mut child = command.spawn()?;
-        drop(remote);
-        let mut ready = [0; 4];
-        if control.read_exact(&mut ready).is_err() || &ready != READY {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::other(
-                "Incompatible file lease keeper (volume manager)",
-            ));
-        }
+            .env("_FILE_LEASE_KEEPER_SOCKET", fd.to_string());
+        let child = helper::spawn(&mut command, vec![remote.into()], &mut control, READY)?;
         let pool = Arc::new(Self {
             control: Mutex::new(Some(control)),
             child: Mutex::new(Some(child)),
@@ -137,7 +113,7 @@ impl Drop for Pool {
             && let Some(mut child) = child.take()
         {
             if self.detached.load(Ordering::Acquire) {
-                super::platform::reap_when_exited(child);
+                helper::reap_when_exited(child);
             } else {
                 let _ = child.wait();
             }
@@ -394,14 +370,7 @@ fn run(fd: &str) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     // The manager handles payloads, so disable ordinary process core dumps.
-    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    limit.rlim_cur = 0;
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    helper::disable_core_dumps()?;
     let state = Arc::new(Mutex::new(State {
         storage: VolumeSet::default(),
         active: 0,
