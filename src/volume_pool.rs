@@ -1,4 +1,4 @@
-//! Experimental inherited-channel volume manager. The public lease protocol and
+//! Inherited-channel macOS volume manager. The public lease protocol and
 //! owner watchers remain in each individual lease helper.
 #[cfg(target_os = "linux")]
 use super::linux::Storage;

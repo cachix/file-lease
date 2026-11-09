@@ -191,7 +191,9 @@ close their descriptors.
 
 ### macOS
 
-The helper creates a private 64 MiB RAM disk, formats it as HFS, and mounts it
+By default, a volume manager shares private 64 MiB RAM disks among overlapping
+leases from the same process and helper executable. It formats each disk as HFS
+and mounts it
 using the system's `hdiutil`, `newfs_hfs`, and `mount` tools. The volume has
 ownership enabled and uses `noexec,nosuid,nodev,nobrowse` mount flags. Its root
 is private (`0700`), and payload files are read-only (`0400`). The returned path
@@ -204,9 +206,11 @@ redirecting payload writes or cleanup into the disk-backed mount directory.
 The owner is watched with `kqueue` process-exit notifications, with process birth
 time checks to avoid confusing a reused PID with the original owner.
 
-Normal cleanup unlinks the files, unmounts the volume, and detaches the RAM disk.
-The setup worker remains alive as a guardian in a separate process group and
-cleans up if the helper is killed. Volume commands have ten-second deadlines;
+Lease cleanup unlinks only that lease's files. The pool reuses free space, adds
+volumes when needed, and detaches surplus empty volumes while retaining one for
+reuse. Closing the last scope and controller tears down the remaining volumes.
+Each volume's setup worker remains alive as a guardian in a separate process
+group and cleans up if the volume manager is killed. Volume commands have ten-second deadlines;
 failed cleanup is retried up to three times with backoff. If both processes die,
 or cleanup keeps failing, a later lease retries recovery. No background service
 is installed.
@@ -224,10 +228,15 @@ take longer. Persistent cleanup failures are recorded in the lease directory's
 private `cleanup.error` file and removed with the recovered lease. Detached
 helpers do not retain application output pipes for diagnostics.
 
-The 64 MiB capacity includes filesystem overhead and all files in that lease.
-A full volume rejects new allocations and removes partial files while preserving
-existing payloads. The RAM-disk backend provides no additional memory-lock
-guarantee.
+Each volume's 64 MiB capacity includes filesystem overhead. The pool checks
+free space before writing and spills into another volume on ENOSPC. A payload
+that cannot fit an empty volume fails; partial files are removed while existing
+payloads remain available. Pool growth has no fixed total capacity limit. The
+RAM-disk backend provides no additional memory-lock guarantee.
+
+A lease helper crash affects its own scope; a volume-manager crash affects every
+scope in that pool. See [Shared macOS volumes](#shared-macos-volumes) for the
+sharing boundary and the separate-volume build option.
 
 ### Other platforms
 
@@ -334,40 +343,9 @@ on [`perf/macos-attachment`](https://github.com/cachix/file-lease/tree/perf/maco
 and its history; the default attachment behavior is unchanged. Reusing a lease
 amortizes volume creation today.
 
-### Shared-volume prototype
+## Shared macOS volumes
 
-The opt-in prototype on
-[`perf/macos-shared-volume`](https://github.com/cachix/file-lease/tree/perf/macos-shared-volume)
-shares a RAM volume among overlapping independent leases from one process and
-matching helper executable. Each lease keeps its own helper, owner watcher, and
-private inherited scope channel. Public `FileLease` methods are unchanged.
-
-A [repeated native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42473073797)
-used three alternating rounds, with thirty sequential joins and twelve concurrent
-joins per variant. Medians for 256-byte payloads were:
-
-| Operation | Separate volumes | Shared volume |
-| --- | ---: | ---: |
-| First file in a new lease while another lease stays live | 240.61 ms | 5.94 ms |
-| Independent lease drop | 31.45 ms | 0.88 ms |
-| Concurrent join | 368.58 ms | 8.53 ms |
-| Initial cold setup | 262.05 ms | 253.91 ms |
-
-Each round created fifteen distinct volumes with the baseline and one with the
-prototype. Cold setup still creates a RAM disk; there is no idle cache, and reuse
-requires overlapping leases. Native tests passed on macOS 26 and macOS 15,
-including distinct-owner exit, independent handoff, helper and manager crashes,
-orphan recovery, interrupted requests, cross-scope release rejection, and volume
-exhaustion.
-
-The prototype is not enabled on the default branch. It shares a 64 MiB capacity
-budget and a manager failure domain: a manager crash revokes every scope using
-that volume. Capacity spillover and this shared failure domain need review before
-adopting it as the default. See the prototype branch for usage and implementation.
-
-## Shared-volume prototype
-
-The experimental `shared-volumes` feature shares macOS RAM volumes across
+The default `shared-volumes` feature shares macOS RAM volumes across
 independent leases created by the same process and matching helper executable.
 Each lease retains its own helper, process-exit watcher, and private inherited
 channel to the volume manager. Paths belong to one scope: another scope cannot
@@ -389,11 +367,16 @@ write errors remain authoritative if filesystem overhead still causes ENOSPC.
 There is no fixed pool
 capacity limit, so peak RAM use scales with the number of volumes needed.
 
-The prototype retains a shared volume-manager failure domain.
+The pool has a shared volume-manager failure domain.
 A lease helper crash revokes only its scope; a manager crash revokes all scopes,
 with the guardian and existing orphan recovery handling volume cleanup. It is
-not enabled by default, and helpers must be built with the matching feature.
-Linux behavior is unchanged.
+enabled by default. Helpers and library consumers must be built with the same
+feature configuration. Linux behavior is unchanged.
+
+To use separate macOS volumes for each lease, set `default-features = false`
+on the library dependency and build the helper with `--no-default-features`.
+Cargo features are additive: another dependency enabling `shared-volumes` also
+enables pooling for your application.
 
 A [native macOS 26 comparison](https://github.com/cachix/file-lease/actions/runs/42591111094)
 used three alternating rounds, with 30 sequential joins and twelve concurrent
@@ -409,11 +392,10 @@ joins per variant. Medians for overlapping independent leases were:
 Each round created fifteen distinct volumes with the baseline and one with the
 prototype. Cold setup still attaches and formats a RAM disk and adds the manager
 process; this design accelerates reuse, not the first lease. All native isolation
-and recovery tests passed on macOS 26 and macOS 15. The opt-in prototype remains
-on [`perf/macos-shared-volume`](https://github.com/cachix/file-lease/tree/perf/macos-shared-volume)
-while spillover and manager-failure tradeoffs are evaluated.
+and recovery tests passed on macOS 26 and macOS 15. The measurements below
+document the evolution of the default shared-volume backend.
 
-`cargo run --locked --release --features shared-volumes --example
+`cargo run --locked --release --example
 shared_volume_timings` measures cold setup, sequential joins while an anchor lease
 remains live, concurrent joins, independent drops, and final teardown. CI compares
 this harness against a fixed unpooled baseline on macOS 26 and macOS 15, and
@@ -436,7 +418,7 @@ every retained volume: the macOS 26 anchor drop took 182.26 ms for the pool vers
 Both macOS hosts passed 48 unit tests, three helper integration tests, and three
 documentation tests, including bounded oversized allocations, released-space
 reuse, cross-volume scope isolation and handoff, and orphan recovery after both
-volume guardians and the manager were killed. The feature remains opt-in.
+volume guardians and the manager were killed.
 
 A [follow-up native comparison](https://github.com/cachix/file-lease/actions/runs/42592834712)
 tested free-space preflight and reclaiming surplus empty volumes against that
@@ -458,8 +440,7 @@ empty volume instead of every volume until shutdown. On macOS 15, concurrent
 joins improved from 418.86 ms to 353.05 ms. These synthetic samples establish the
 tradeoff for this workload, not a general throughput or memory-footprint claim.
 Both macOS hosts passed 49 unit tests, three helper integration tests, and three
-documentation tests. Linux CI also passed. The public API and opt-in status are
-unchanged.
+documentation tests. Linux CI also passed. The public API is unchanged.
 
 ## Development
 

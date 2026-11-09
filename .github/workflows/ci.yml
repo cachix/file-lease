@@ -33,9 +33,22 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint all targets
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test leases, crash recovery, deadlines, and volume exhaustion
-        # macOS tests exercise real RAM volumes and interrupted recovery.
+      - name: Lint the separate-volume opt-out
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Test default leases, crash recovery, deadlines, and volume exhaustion
+        # macOS tests exercise real pooled volumes and interrupted recovery.
+        run: cargo test --locked -- --test-threads=1
+      - name: Test separate-volume opt-out
+        run: cargo test --locked --no-default-features -- --test-threads=1
+      - name: Test all features
         run: cargo test --locked --all-features -- --test-threads=1
+      - name: Verify documentation and the release package
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --locked --no-deps --all-features
+          cargo package --locked
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: runner.os == 'macOS'
         with:
@@ -60,7 +73,7 @@ jobs:
           cp examples/shared_volume_timings.rs previous/examples/shared_volume_timings.rs
           CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-baseline-target" cargo build --locked --release --manifest-path baseline/Cargo.toml --example shared_volume_timings
           CARGO_TARGET_DIR="$RUNNER_TEMP/file-lease-previous-target" cargo build --locked --release --features shared-volumes --manifest-path previous/Cargo.toml --example shared_volume_timings
-          cargo build --locked --release --features shared-volumes --example shared_volume_timings
+          cargo build --locked --release --example shared_volume_timings
           baseline_bin="$RUNNER_TEMP/file-lease-baseline-target/release/examples/shared_volume_timings"
           previous_bin="$RUNNER_TEMP/file-lease-previous-target/release/examples/shared_volume_timings"
           pooled_bin="$GITHUB_WORKSPACE/target/release/examples/shared_volume_timings"
