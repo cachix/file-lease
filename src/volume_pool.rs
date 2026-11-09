@@ -4,6 +4,10 @@
 use super::linux::Storage;
 #[cfg(target_os = "macos")]
 use super::macos::Storage;
+use super::protocol::{
+    ALLOCATE, CLOSE, MAX_MESSAGE_BYTES, RELEASE, read_allocation, read_string, write_allocation,
+    write_string,
+};
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Read, Write},
@@ -23,8 +27,6 @@ const CONTROL: &str = "_FILE_LEASE_VOLUME_CONTROL";
 #[cfg(target_os = "macos")]
 const CHANNEL: &str = "_FILE_LEASE_VOLUME_CHANNEL";
 const READY: &[u8; 4] = b"FLV1";
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_PATH: usize = 16384;
 
 pub(crate) struct Pool {
     control: Mutex<Option<UnixStream>>,
@@ -246,14 +248,10 @@ impl RemoteStorage {
             .stream
             .as_mut()
             .ok_or_else(|| io::Error::other("Volume scope closed"))?;
-        stream.write_all(&[1])?;
-        stream.write_all(&(bytes.len() as u64).to_le_bytes())?;
-        stream.write_all(&(suffix.len() as u32).to_le_bytes())?;
-        stream.write_all(suffix.as_bytes())?;
-        stream.write_all(bytes)?;
+        write_allocation(stream, bytes, suffix)?;
         let mut status = [0];
         stream.read_exact(&mut status)?;
-        let message = read_string(stream, MAX_PATH)?;
+        let message = read_string(stream, MAX_MESSAGE_BYTES)?;
         if status == [1] {
             Ok(PathBuf::from(message))
         } else {
@@ -268,7 +266,7 @@ impl RemoteStorage {
             .stream
             .as_mut()
             .ok_or_else(|| io::Error::other("Volume scope closed"))?;
-        stream.write_all(&[4])?;
+        stream.write_all(&[RELEASE])?;
         write_string(stream, path)?;
         let mut ack = [0];
         stream.read_exact(&mut ack)?;
@@ -282,7 +280,7 @@ impl RemoteStorage {
     }
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {
         if let Some(mut stream) = self.stream.take() {
-            stream.write_all(&[3])?;
+            stream.write_all(&[CLOSE])?;
             let mut ack = [0];
             stream.read_exact(&mut ack)?;
             if ack != [1] {
@@ -296,25 +294,6 @@ impl Drop for RemoteStorage {
     fn drop(&mut self) {
         let _ = self.cleanup();
     }
-}
-
-fn write_string(stream: &mut UnixStream, value: &str) -> io::Result<()> {
-    if value.len() > MAX_PATH {
-        return Err(io::Error::other("Oversized volume reply"));
-    }
-    stream.write_all(&(value.len() as u32).to_le_bytes())?;
-    stream.write_all(value.as_bytes())
-}
-fn read_string(stream: &mut UnixStream, maximum: usize) -> io::Result<String> {
-    let mut length = [0; 4];
-    stream.read_exact(&mut length)?;
-    let length = u32::from_le_bytes(length) as usize;
-    if length > maximum {
-        return Err(io::Error::other("Oversized volume message"));
-    }
-    let mut bytes = vec![0; length];
-    stream.read_exact(&mut bytes)?;
-    String::from_utf8(bytes).map_err(io::Error::other)
 }
 
 // Each backend tracks its own paths. Keep at most one empty volume warm for
@@ -462,22 +441,8 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                 result => result?,
             }
             match op[0] {
-                1 => {
-                    let mut length = [0; 8];
-                    stream.read_exact(&mut length)?;
-                    let length = u64::from_le_bytes(length);
-                    if length > MAX_BYTES {
-                        return Err(io::Error::other("Oversized volume payload"));
-                    }
-                    let suffix = read_string(&mut stream, 80)?;
-                    if !suffix
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-                    {
-                        return Err(io::Error::other("Invalid volume suffix"));
-                    }
-                    let mut bytes = zeroize::Zeroizing::new(vec![0; length as usize]);
-                    stream.read_exact(&mut bytes)?;
+                ALLOCATE => {
+                    let (bytes, suffix) = read_allocation(&mut stream)?;
                     let allocated = state
                         .lock()
                         .map_err(|_| io::Error::other("Volume state poisoned"))?
@@ -498,7 +463,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                             let message = error.to_string();
                             write_string(
                                 &mut stream,
-                                if message.len() <= MAX_PATH {
+                                if message.len() <= MAX_MESSAGE_BYTES {
                                     &message
                                 } else {
                                     "Volume allocation failed"
@@ -507,8 +472,8 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                         }
                     }
                 }
-                4 => {
-                    let path = PathBuf::from(read_string(&mut stream, MAX_PATH)?);
+                RELEASE => {
+                    let path = PathBuf::from(read_string(&mut stream, MAX_MESSAGE_BYTES)?);
                     let released = paths.contains(&path)
                         && state
                             .lock()
@@ -521,7 +486,7 @@ fn serve(channel: OwnedFd, state: Arc<Mutex<State>>) {
                     }
                     stream.write_all(&[u8::from(released)])?;
                 }
-                3 => {
+                CLOSE => {
                     cleanup_paths(&mut paths, &state)?;
                     stream.write_all(&[1])?;
                     return Ok(());
@@ -672,7 +637,7 @@ mod tests {
         let next = storage.materialize(&payload, "").unwrap();
         assert_eq!(one.parent(), next.parent());
         assert_eq!(storage.volumes.len(), 2);
-        let oversized = vec![52; MAX_BYTES as usize];
+        let oversized = vec![52; crate::protocol::MAX_SECRET_BYTES as usize];
         for _ in 0..2 {
             let error = storage.materialize(&oversized, "").unwrap_err();
             assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));

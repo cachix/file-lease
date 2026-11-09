@@ -1,3 +1,4 @@
+use super::protocol::{self, ALLOCATE, CLOSE, HANDOFF, MAX_MESSAGE_BYTES, RELEASE};
 use super::*;
 use std::{
     io::{Read, Write},
@@ -19,11 +20,6 @@ use super::volume_pool::RemoteStorage as Storage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
-const ALLOCATE: u8 = 1;
-const HANDOFF: u8 = 2;
-const CLOSE: u8 = 3;
-const RELEASE: u8 = 4;
-const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
 const ALLOCATION_ERROR: u32 = u32::MAX;
 // Version 2 requires locked Linux storage and framed allocation errors. Reject
 // older helpers before sending payloads rather than accepting pageable files.
@@ -182,47 +178,26 @@ impl Keeper {
 
     pub(super) fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
         let _span = super::profiling::Span::new("lease.allocate");
-        if bytes.len() as u64 > MAX_SECRET_BYTES {
-            return Err(io::Error::other("Secret exceeds file lease size limit"));
-        }
-        if suffix.len() > 80
-            || !suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-        {
-            return Err(io::Error::other("Invalid secret file suffix"));
-        }
         let stream = &mut self.stream;
         if self.handed_off {
             return Err(io::Error::other("File lease has been handed off"));
         }
-        stream.write_all(&[ALLOCATE])?;
-        stream.write_all(&(bytes.len() as u64).to_le_bytes())?;
-        stream.write_all(&(suffix.len() as u32).to_le_bytes())?;
-        stream.write_all(suffix.as_bytes())?;
-        stream.write_all(bytes)?;
+        protocol::write_allocation(stream, bytes, suffix)?;
         let mut length = [0; 4];
         stream.read_exact(&mut length)?;
         let reply = u32::from_le_bytes(length);
         let failed = reply == ALLOCATION_ERROR;
-        let length = if failed {
-            stream.read_exact(&mut length)?;
-            u32::from_le_bytes(length) as usize
+        let path = if failed {
+            protocol::read_string(stream, MAX_MESSAGE_BYTES)?
         } else {
-            reply as usize
+            protocol::read_string_body(stream, reply as usize, MAX_MESSAGE_BYTES)?
         };
-        if length > 16384 {
-            return Err(io::Error::other("Invalid file keeper reply"));
-        }
-        let mut path = vec![0; length];
-        stream.read_exact(&mut path)?;
-        let path = String::from_utf8(path).map_err(io::Error::other)?;
         if failed {
             return Err(io::Error::other(format!(
                 "File keeper could not allocate secret storage: {path}"
             )));
         }
-        if length == 0 {
+        if path.is_empty() {
             return Err(io::Error::other(
                 "File keeper could not allocate secret storage",
             ));
@@ -234,13 +209,12 @@ impl Keeper {
         let path = path
             .to_str()
             .ok_or_else(|| io::Error::other("Non-UTF-8 lease path"))?;
-        if path.len() > 16384 {
+        if path.len() > MAX_MESSAGE_BYTES {
             return Err(io::Error::other("Oversized lease path"));
         }
         let stream = &mut self.stream;
         stream.write_all(&[RELEASE])?;
-        stream.write_all(&(path.len() as u32).to_le_bytes())?;
-        stream.write_all(path.as_bytes())?;
+        protocol::write_string(stream, path)?;
         let mut ack = [0];
         stream.read_exact(&mut ack)?;
         if ack != [1] {
@@ -390,26 +364,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                 if handed_off {
                     return Err(io::Error::other("Cannot allocate after file lease handoff"));
                 }
-                let mut length = [0; 8];
-                stream.read_exact(&mut length)?;
-                let length = u64::from_le_bytes(length);
-                let mut suffix_length = [0; 4];
-                stream.read_exact(&mut suffix_length)?;
-                let suffix_length = u32::from_le_bytes(suffix_length) as usize;
-                if length > MAX_SECRET_BYTES || suffix_length > 80 {
-                    return Err(io::Error::other("Oversized secret file request"));
-                }
-                let mut suffix = vec![0; suffix_length];
-                stream.read_exact(&mut suffix)?;
-                let suffix = String::from_utf8(suffix).map_err(io::Error::other)?;
-                if !suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-                {
-                    return Err(io::Error::other("Invalid secret file suffix"));
-                }
-                let mut bytes = zeroize::Zeroizing::new(vec![0; length as usize]);
-                stream.read_exact(&mut bytes)?;
+                let (bytes, suffix) = protocol::read_allocation(&mut stream)?;
                 let path = storage
                     .lock()
                     .map_err(|_| io::Error::other("Storage lock poisoned"))?
@@ -419,13 +374,12 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                         let path = path
                             .to_str()
                             .ok_or_else(|| io::Error::other("Non-UTF-8 file lease path"))?;
-                        stream.write_all(&(path.len() as u32).to_le_bytes())?;
-                        stream.write_all(path.as_bytes())?;
+                        protocol::write_string(&mut stream, path)?;
                     }
                     Err(error) => {
                         eprintln!("file-lease storage: {error}");
                         let message = error.to_string();
-                        let message = if message.len() <= 16384 {
+                        let message = if message.len() <= MAX_MESSAGE_BYTES {
                             &message
                         } else {
                             "Secret storage allocation failed (oversized helper error)"
@@ -433,8 +387,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                         // The versioned handshake rejects clients that do not
                         // understand this bounded error-message frame.
                         stream.write_all(&ALLOCATION_ERROR.to_le_bytes())?;
-                        stream.write_all(&(message.len() as u32).to_le_bytes())?;
-                        stream.write_all(message.as_bytes())?;
+                        protocol::write_string(&mut stream, message)?;
                     }
                 }
             }
@@ -457,15 +410,7 @@ fn run_keeper(socket: &str) -> io::Result<()> {
                 stream.write_all(&[1])?;
             }
             RELEASE => {
-                let mut length = [0; 4];
-                stream.read_exact(&mut length)?;
-                let length = u32::from_le_bytes(length) as usize;
-                if length > 16384 {
-                    return Err(io::Error::other("Oversized lease path"));
-                }
-                let mut path = vec![0; length];
-                stream.read_exact(&mut path)?;
-                let path = String::from_utf8(path).map_err(io::Error::other)?;
+                let path = protocol::read_string(&mut stream, MAX_MESSAGE_BYTES)?;
                 let result = storage
                     .lock()
                     .map_err(|_| io::Error::other("Storage lock poisoned"))?
