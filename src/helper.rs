@@ -3,11 +3,32 @@
 use std::{
     io::{self, Read},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command, Stdio},
 };
+
+pub(crate) fn close_on_exec(fd: RawFd) -> io::Result<()> {
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Adopt an inherited descriptor and prevent it from reaching subprocesses.
+///
+/// # Safety
+/// If `fd` is open and above stdio, the caller must exclusively own it and
+/// relinquish ownership on success. Invalid descriptors are rejected before
+/// constructing an owned handle.
+pub(crate) unsafe fn take_inherited(fd: RawFd) -> io::Result<OwnedFd> {
+    if fd < 3 {
+        return Err(io::Error::other("Invalid inherited helper descriptor"));
+    }
+    close_on_exec(fd)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
 
 // Descriptors inherited through exec must not collide with child stdio setup.
 pub(crate) fn above_stdio<T: Into<OwnedFd> + From<OwnedFd>>(descriptor: T) -> io::Result<T> {
@@ -105,7 +126,32 @@ pub(crate) fn reap_when_exited(child: Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{io::Write, os::fd::IntoRawFd, time::Duration};
+
+    #[test]
+    fn inherited_channels_restore_close_on_exec_and_transfer_ownership() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let fd = stream.into_raw_fd();
+        // Model a descriptor whose close-on-exec flag was cleared for startup.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        let mut inherited = UnixStream::from(unsafe { take_inherited(fd) }.unwrap());
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        peer.write_all(b"owned").unwrap();
+        let mut bytes = [0; 5];
+        inherited.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"owned");
+        drop(inherited);
+        assert_eq!(peer.read(&mut bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn invalid_inherited_descriptors_are_rejected() {
+        for fd in [-1, 0, 1, 2, i32::MAX] {
+            assert!(unsafe { take_inherited(fd) }.is_err());
+        }
+    }
 
     #[test]
     fn helper_exit_before_handshake_reports_eof() {

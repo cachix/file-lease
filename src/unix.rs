@@ -4,7 +4,7 @@ use super::*;
 use std::{
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, OwnedFd},
         unix::net::UnixStream,
     },
     process::{Child, Command},
@@ -244,25 +244,15 @@ fn run_keeper(socket: &str) -> io::Result<()> {
         .map_err(io::Error::other)?
         .parse()
         .map_err(io::Error::other)?;
-    if socket < 3 {
-        return Err(io::Error::other("Invalid file keeper socket"));
-    }
     // This descriptor is inherited exclusively by the keeper executable.
-    let mut stream = unsafe { UnixStream::from_raw_fd(socket) };
-    // macOS storage starts system tools. Do not let them inherit the private
-    // control channel or keep its EOF alive in a DiskImages helper.
-    if unsafe { libc::fcntl(socket, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let mut stream = UnixStream::from(unsafe { helper::take_inherited(socket)? });
     #[cfg(target_os = "linux")]
     let owner = {
-        if owner < 3 || socket == owner {
+        if socket == owner {
             return Err(io::Error::other("Invalid file keeper owner descriptor"));
         }
-        if unsafe { libc::fcntl(owner, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe { OwnedFd::from_raw_fd(owner) }
+        // The launcher transfers a separate, exclusively owned pidfd.
+        unsafe { helper::take_inherited(owner)? }
     };
     #[cfg(target_os = "macos")]
     let owner = {
