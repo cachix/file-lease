@@ -3,7 +3,7 @@
 use std::{
     io,
     os::unix::process::CommandExt,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     time::{Duration, Instant},
 };
 use wait_timeout::ChildExt;
@@ -31,12 +31,24 @@ pub(super) fn run_until(command: &mut Command, deadline: Instant) -> io::Result<
     run(command, timeout)
 }
 
-pub(super) fn wait(mut child: Child, timeout: Duration) -> io::Result<()> {
+pub(super) fn wait(child: Child, timeout: Duration) -> io::Result<()> {
+    let status = wait_status(child, timeout)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(exit_error(status))
+    }
+}
+
+pub(super) fn exit_error(status: ExitStatus) -> io::Error {
+    io::Error::other(format!("Volume tool exited with {status}"))
+}
+
+/// Return the exit status of a tool that exited by itself. Errors mean it was
+/// terminated, so any work it started may still be in flight.
+pub(super) fn wait_status(mut child: Child, timeout: Duration) -> io::Result<ExitStatus> {
     match child.wait_timeout(timeout) {
-        Ok(Some(status)) if status.success() => Ok(()),
-        Ok(Some(status)) => Err(io::Error::other(format!(
-            "Volume tool exited with {status}"
-        ))),
+        Ok(Some(status)) => Ok(status),
         Ok(None) => {
             terminate(child);
             Err(io::Error::new(

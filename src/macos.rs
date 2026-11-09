@@ -261,10 +261,17 @@ impl Journal {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        if let Some(id) = self.lease_id
-            && registry::device(id)?.as_deref() != Some(self.device.as_str())
-        {
-            return Err(io::Error::other("RAM-disk lease identifier changed"));
+        if let Some(id) = self.lease_id {
+            match registry::device(id)? {
+                // Disk numbers are reused eagerly. With no device carrying our
+                // identifier, this node belongs to another attachment and ours
+                // is already gone.
+                None => return Ok(false),
+                Some(device) if device != self.device => {
+                    return Err(io::Error::other("RAM-disk lease identifier changed"));
+                }
+                Some(_) => {}
+            }
         }
         if Some(device_identity(&metadata)) != self.device_identity {
             return Err(io::Error::other("RAM-disk device identity changed"));
@@ -637,34 +644,13 @@ fn setup_device(directory: &Path) -> io::Result<()> {
         super::command::terminate(attach);
         return Err(error);
     }
-    super::command::wait(attach, TOOL_TIMEOUT)
+    // A terminated attachment may still be in flight, so its journal stays
+    // conservative. Only a tool that exited by itself has a final outcome.
+    let status = super::command::wait_status(attach, TOOL_TIMEOUT)
         .map_err(|error| io::Error::new(error.kind(), format!("hdiutil attach: {error}")))?;
     #[cfg(feature = "profiling")]
     drop(attach_span);
-    match registry::device(id)? {
-        Some(device) => {
-            journal.device_identity = Some(device_identity(&fs::metadata(&device)?));
-            journal.device = device;
-        }
-        None => {
-            // Fail closed on systems without drive-key support, but detach the
-            // device reported directly by our completed attachment command.
-            let output = fs::read_to_string(directory.join("setup.lock"))?;
-            if let Some(device) = output.split_whitespace().find(|value| {
-                value.strip_prefix("/dev/disk").is_some_and(|digits| {
-                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            }) {
-                command(
-                    "/usr/bin/hdiutil",
-                    &["detach".as_ref(), "-force".as_ref(), device.as_ref()],
-                )?;
-            }
-            return Err(io::Error::other(
-                "RAM-disk lease identifier was not registered",
-            ));
-        }
-    }
+    record_attachment(&mut journal, directory, status)?;
     let mount = journal.mount.clone();
     let uid = unsafe { libc::geteuid() }.to_string();
     let gid = unsafe { libc::getegid() }.to_string();
@@ -712,6 +698,52 @@ fn setup_device(directory: &Path) -> io::Result<()> {
     }
     journal.save(directory)?;
     Ok(())
+}
+
+/// Record the outcome of an attachment command that has exited.
+fn record_attachment(
+    journal: &mut Journal,
+    directory: &Path,
+    status: std::process::ExitStatus,
+) -> io::Result<()> {
+    let id = journal
+        .lease_id
+        .ok_or_else(|| io::Error::other("Missing file lease identifier"))?;
+    if let Some(device) = registry::device(id)? {
+        journal.device_identity = Some(device_identity(&fs::metadata(&device)?));
+        journal.device = device;
+        if status.success() {
+            return Ok(());
+        }
+        // A failed command that still attached our device leaves it
+        // identified, so cleanup can detach it.
+        journal.save(directory)?;
+        return Err(super::command::exit_error(status));
+    }
+    // Fail closed on systems without drive-key support, but detach the
+    // device reported directly by our completed attachment command. If that
+    // detach fails, the journal keeps the attachment unresolved.
+    let output = fs::read_to_string(directory.join("setup.lock"))?;
+    if let Some(device) = output.split_whitespace().find(|value| {
+        value.strip_prefix("/dev/disk").is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) {
+        command(
+            "/usr/bin/hdiutil",
+            &["detach".as_ref(), "-force".as_ref(), device.as_ref()],
+        )?;
+    }
+    // No device carries our identifier, so nothing remains to detach.
+    // Without this, recovery could never identify the attachment and would
+    // keep the lease directory forever.
+    journal.attachment_started = Some(false);
+    journal.save(directory)?;
+    Err(if status.success() {
+        io::Error::other("RAM-disk lease identifier was not registered")
+    } else {
+        super::command::exit_error(status)
+    })
 }
 
 fn checkpoint(stage: &str, directory: &Path, device: &str) -> io::Result<()> {
@@ -1234,6 +1266,40 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (directory, _) = unattached_journal(root.path());
         recover_orphans(root.path()).unwrap();
+        assert!(!directory.path().exists());
+    }
+
+    #[test]
+    fn exited_attachments_without_a_registered_device_are_recoverable() {
+        use std::os::unix::process::ExitStatusExt;
+        let root = tempfile::tempdir().unwrap();
+        // Exit code 1, and a success that never registered our identifier.
+        for status in [1 << 8, 0] {
+            let (directory, mut journal) = unattached_journal(root.path());
+            journal.attachment_started = Some(true);
+            journal.save(directory.path()).unwrap();
+            let status = std::process::ExitStatus::from_raw(status);
+            assert!(record_attachment(&mut journal, directory.path(), status).is_err());
+            let saved = Journal::read(directory.path()).unwrap();
+            assert_eq!(saved.attachment_started, Some(false));
+            assert!(saved.device.is_empty());
+            cleanup_directory(directory.path()).unwrap();
+            assert!(!directory.path().exists());
+        }
+    }
+
+    #[test]
+    fn reused_disk_number_does_not_block_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let (directory, mut journal) = unattached_journal(root.path());
+        // The boot disk stands in for another attachment that reused our
+        // disk number. No device carries this journal's fresh identifier.
+        journal.device = "/dev/disk0".into();
+        journal.device_identity = Some(device_identity(&fs::metadata("/dev/disk0").unwrap()));
+        journal.attachment_started = Some(true);
+        journal.save(directory.path()).unwrap();
+        assert!(!journal.validate_device().unwrap());
+        cleanup_directory(directory.path()).unwrap();
         assert!(!directory.path().exists());
     }
 
