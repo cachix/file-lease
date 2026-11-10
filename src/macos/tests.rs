@@ -627,7 +627,6 @@ fn killing_both_processes_leaves_recoverable_metadata() {
     removed(&directory, id);
 }
 
-#[cfg(feature = "shared-volumes")]
 #[test]
 fn dead_shared_manager_and_guardians_leave_all_volumes_recoverable() {
     let pool = crate::volume_pool::Pool::get(&std::env::current_exe().unwrap()).unwrap();

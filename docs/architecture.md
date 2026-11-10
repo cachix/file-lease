@@ -88,7 +88,7 @@ RAM-disk backend provides no additional memory-lock guarantee.
 
 A lease helper crash affects its own scope; a volume-manager crash affects every
 scope in that pool. See [Shared macOS volumes](#shared-macos-volumes) for the
-sharing boundary and the separate-volume build option.
+sharing boundary.
 
 ## Other platforms
 
@@ -115,8 +115,8 @@ pathname revocation cannot erase bytes already copied by a reader.
 
 ## Shared macOS volumes
 
-The default `shared-volumes` feature shares macOS RAM volumes across
-independent leases created by the same process and matching helper executable.
+macOS RAM volumes are shared across independent leases created by the same
+process and matching helper executable.
 Each lease retains its own helper, process-exit watcher, and private inherited
 channel to the volume manager. Paths belong to one scope: another scope cannot
 release them. Dropping a lease revokes only its paths; handing it off keeps its
@@ -138,14 +138,15 @@ There is no fixed pool capacity limit, so peak RAM use scales with the number of
 
 The pool has a shared volume-manager failure domain.
 A lease helper crash revokes only its scope; a manager crash revokes all scopes,
-with the guardian and existing orphan recovery handling volume cleanup. It is
-enabled by default. Helpers and library consumers must be built with the same
-feature configuration. Linux behavior is unchanged.
+with the guardian and existing orphan recovery handling volume cleanup. Linux
+does not use volumes and is unaffected.
 
-To use separate macOS volumes for each lease, set `default-features = false`
-on the library dependency and build the helper with `--no-default-features`.
-Cargo features are additive: another dependency enabling `shared-volumes` also
-enables pooling for your application.
+Sharing helps only overlapping leases. A process that creates one lease at a
+time pays for the manager process on each cold setup; the
+[measurements](performance.md#shared-volume-measurements) put this at roughly
+50 ms on macOS 26. Earlier releases offered separate volumes per lease through
+the `shared-volumes` Cargo feature. Because Cargo features are additive, any
+dependency could re-enable sharing, so the opt-out was removed.
 
 ## Alternatives
 

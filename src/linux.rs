@@ -77,12 +77,12 @@ impl Storage {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "shared-volumes"))]
+    #[cfg(test)]
     pub(super) fn contains(&self, path: &std::path::Path) -> bool {
         self.files.contains_key(path)
     }
 
-    #[cfg(all(test, feature = "shared-volumes"))]
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.files.is_empty()
     }

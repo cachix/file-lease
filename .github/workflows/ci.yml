@@ -33,13 +33,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint all targets
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Lint the separate-volume opt-out
-        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Test default leases, crash recovery, deadlines, and volume exhaustion
         # macOS tests exercise real pooled volumes and interrupted recovery.
         run: cargo test --locked -- --test-threads=1
-      - name: Test separate-volume opt-out
-        run: cargo test --locked --no-default-features -- --test-threads=1
       - name: Test all features
         run: cargo test --locked --all-features -- --test-threads=1
       - name: Verify documentation and the release package

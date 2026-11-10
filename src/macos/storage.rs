@@ -1,9 +1,7 @@
 //! Payload allocation and revocation through a pinned, validated RAM mount.
 use super::{recovery::cleanup_with_retry, setup::Volume, unlink_payload};
 use crate::profiling::Span;
-#[cfg(feature = "shared-volumes")]
-use rustix::fs::fstatfs;
-use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
+use rustix::fs::{AtFlags, Mode, OFlags, fstatfs, openat, unlinkat};
 use std::{
     fs,
     io::{self, Write},
@@ -25,16 +23,13 @@ impl Storage {
         }
         let volume = self.volume.as_ref().unwrap();
         let root = volume.open_root()?;
-        #[cfg(feature = "shared-volumes")]
-        {
-            // Query the pinned, validated mount before opening a payload file.
-            // This rejects known-full volumes without writing partial payloads.
-            // Free space is only a preflight: metadata or other writers may
-            // still cause ENOSPC during the write, which remains authoritative.
-            let info = fstatfs(&root)?;
-            if bytes.len() as u64 > info.f_bavail.saturating_mul(u64::from(info.f_bsize)) {
-                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
-            }
+        // Query the pinned, validated mount before opening a payload file.
+        // This rejects known-full volumes without writing partial payloads.
+        // Free space is only a preflight: metadata or other writers may
+        // still cause ENOSPC during the write, which remains authoritative.
+        let info = fstatfs(&root)?;
+        if bytes.len() as u64 > info.f_bavail.saturating_mul(u64::from(info.f_bsize)) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         let _span = Span::new("file.write");
         self.counter = self
@@ -93,12 +88,10 @@ impl Storage {
         Ok(())
     }
 
-    #[cfg(feature = "shared-volumes")]
     pub(crate) fn contains(&self, path: &Path) -> bool {
         self.files.contains(path)
     }
 
-    #[cfg(feature = "shared-volumes")]
     pub(crate) fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
