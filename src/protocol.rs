@@ -102,10 +102,7 @@ pub(crate) const KEEPER_REPLY: ReplyCodec = ReplyCodec {
     error_marker: Some(u32::MAX),
     oversized_error: "Secret storage allocation failed (oversized helper error)",
 };
-#[cfg(all(
-    feature = "shared-volumes",
-    any(target_os = "macos", all(test, target_os = "linux"))
-))]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 pub(crate) const SCOPE_REPLY: ReplyCodec = ReplyCodec {
     error_marker: None,
     oversized_error: "Volume allocation failed",
@@ -249,7 +246,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shared-volumes")]
     #[test]
     fn scope_reply_wire_format_and_error_boundaries() {
         check_reply_codec(

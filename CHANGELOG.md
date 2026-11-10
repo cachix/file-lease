@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Always share macOS RAM volumes across overlapping leases and remove the
+  `shared-volumes` feature. Builds that disabled default features to get
+  separate volumes now share them; builds naming the feature must drop it.
+  Linux helpers no longer reject libraries built with a different feature set.
+
 ## [0.1.0] - 2026-11-09
 
 - Stop searching PATH for the helper. Without `with_helper_executable`, the

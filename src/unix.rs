@@ -13,21 +13,19 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use super::linux::{Storage, watch_owner};
-#[cfg(all(target_os = "macos", not(feature = "shared-volumes")))]
-use super::macos::Storage;
 #[cfg(target_os = "macos")]
 use super::macos::watch_owner;
-#[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+#[cfg(target_os = "macos")]
 use super::volume_pool::RemoteStorage as Storage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
 // Version 4 adds the build identity to the handshake. Reject older helpers
 // before sending payloads rather than accepting an unknown storage contract.
-#[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
+#[cfg(not(target_os = "macos"))]
 const READY: &[u8; 4] = b"SFL4";
-#[cfg(all(target_os = "macos", feature = "shared-volumes"))]
-// Shared-volume helpers require a separate inherited scope channel.
+#[cfg(target_os = "macos")]
+// macOS helpers require a separate inherited channel to the volume pool.
 const READY: &[u8; 4] = b"SFL5";
 
 // FileLease owns this behind its shared mutex. Mutable access serializes the
@@ -36,7 +34,7 @@ pub(super) struct Keeper {
     stream: UnixStream,
     child: Option<Child>,
     handed_off: bool,
-    #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+    #[cfg(target_os = "macos")]
     pool: Arc<super::volume_pool::Pool>,
 }
 
@@ -106,12 +104,12 @@ impl Keeper {
                 }
             }
         };
-        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        #[cfg(target_os = "macos")]
         let pool = super::volume_pool::Pool::get(&executable)?;
-        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        #[cfg(target_os = "macos")]
         let volume_channel = above_stdio(pool.connect()?)?;
         let mut command = Command::new(executable);
-        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+        #[cfg(target_os = "macos")]
         command.env(
             super::volume_pool::channel_env(),
             volume_channel.as_raw_fd().to_string(),
@@ -132,19 +130,13 @@ impl Keeper {
         #[cfg(target_os = "linux")]
         let inherited = vec![remote.into(), owner];
         #[cfg(target_os = "macos")]
-        let inherited = vec![remote.into()];
-        #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
-        let inherited = {
-            let mut descriptors = inherited;
-            descriptors.push(volume_channel);
-            descriptors
-        };
+        let inherited = vec![remote.into(), volume_channel];
         let child = helper::spawn(&mut command, inherited, &mut stream, READY)?;
         Ok(Self {
             stream,
             child: Some(child),
             handed_off: false,
-            #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+            #[cfg(target_os = "macos")]
             pool,
         })
     }
@@ -199,7 +191,7 @@ impl Keeper {
                 tagged(ErrorKind::Handoff, "File lease handoff failed")
             })?;
             self.handed_off = true;
-            #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+            #[cfg(target_os = "macos")]
             self.pool.handoff();
         }
         Ok(())
@@ -213,8 +205,8 @@ impl Drop for Keeper {
             if self.handed_off {
                 reap_when_exited(child);
             } else {
-                // Graceful shutdown also unmounts macOS volumes. If the keeper
-                // was killed, its macOS guardian independently cleans up.
+                // Graceful shutdown also revokes macOS pool paths. If the keeper
+                // was killed, the pool revokes its scope when the channel closes.
                 let _ = self.stream.write_all(&[CLOSE]);
                 let _ = child.wait();
             }
@@ -227,10 +219,7 @@ pub(super) fn maybe_run_keeper() -> Option<i32> {
     if let Some(result) = super::macos::maybe_run_setup() {
         return Some(result.map_or_else(|_| 1, |_| 0));
     }
-    #[cfg(all(
-        feature = "shared-volumes",
-        any(target_os = "macos", all(test, target_os = "linux"))
-    ))]
+    #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
     if let Some(code) = super::volume_pool::maybe_run() {
         return Some(code);
     }
@@ -279,9 +268,9 @@ fn run_keeper(socket: &str) -> io::Result<()> {
         watch
     };
     helper::disable_core_dumps()?;
-    #[cfg(all(target_os = "macos", feature = "shared-volumes"))]
+    #[cfg(target_os = "macos")]
     let storage = Storage::from_env()?;
-    #[cfg(not(all(target_os = "macos", feature = "shared-volumes")))]
+    #[cfg(not(target_os = "macos"))]
     let storage = Storage::default();
     let storage = Arc::new(Mutex::new(storage));
     let mut owner_watch = OwnerWatch::start(owner, storage.clone())?;

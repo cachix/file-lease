@@ -103,9 +103,6 @@ fn spawn_with_timeout(
 
 /// Identifies the build on both sides of a handshake. The wire protocol and
 /// recovery format are internal, so only an identical build is compatible.
-#[cfg(feature = "shared-volumes")]
-const BUILD: &str = concat!("file-lease ", env!("CARGO_PKG_VERSION"), " shared-volumes");
-#[cfg(not(feature = "shared-volumes"))]
 const BUILD: &str = concat!("file-lease ", env!("CARGO_PKG_VERSION"));
 
 /// Announce readiness: the protocol tag, then this build's identity.

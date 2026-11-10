@@ -161,7 +161,7 @@ the startup handshake is terminated and allocation returns `TimedOut`.
 | Platform | Storage | Paths |
 | --- | --- | --- |
 | Linux | Sealed `memfd` files with pages locked before payload writes. | `/proc/<helper-pid>/fd/<fd>`; suffix hints are omitted. |
-| macOS | Private HFS RAM volumes, shared across overlapping leases by default. | Ordinary file paths; suffix hints are preserved. |
+| macOS | Private HFS RAM volumes, shared across overlapping leases in one process. | Ordinary file paths; suffix hints are preserved. |
 | Windows | Not supported yet. | Allocation returns `Unsupported`. |
 
 Other operating systems also return `Unsupported` on allocation.
@@ -177,8 +177,8 @@ leases in that pool. Guardians and recovery journals handle orphaned volumes.
 macOS provides no additional memory-lock guarantee.
 
 [Architecture and guarantees](https://github.com/cachix/file-lease/blob/main/docs/architecture.md)
-describes owner monitoring, crash recovery, capacity, and the separate-volume
-build option. [Performance measurements](https://github.com/cachix/file-lease/blob/main/docs/performance.md)
+describes owner monitoring, crash recovery, capacity, and volume sharing.
+[Performance measurements](https://github.com/cachix/file-lease/blob/main/docs/performance.md)
 cover startup, reuse, and cleanup costs on macOS 15 and 26.
 
 ## Limits
@@ -195,7 +195,6 @@ or hibernation image.
 ## Development
 
 See [contribution and testing instructions](https://github.com/cachix/file-lease/blob/main/docs/development.md).
-CI exercises Linux, macOS 15, and macOS 26 with default features, all features,
-and the separate-volume opt-out.
+CI exercises Linux, macOS 15, and macOS 26 with default and all features.
 
 Licensed under [Apache 2.0](https://github.com/cachix/file-lease/blob/main/LICENSE).
