@@ -103,6 +103,27 @@ and [temporary files](https://learn.microsoft.com/en-us/windows/win32/api/fileap
 
 ## Common limits
 
+### Named paths
+
+`FileOptions::filename` exposes a payload through a symlink with the requested
+basename on either supported platform. The lease helper allocates a fresh
+private (`0700`) temporary directory for each named file and tracks the link
+alongside its backing path. Only directory and symlink metadata may be
+disk-backed; the payload always uses the existing memory-backed backend.
+The filename accepts 1 to 255 ASCII letters, digits, dots, underscores, or
+hyphens, excluding `.` and `..`. A filename and suffix cannot be combined.
+
+Releasing a named file revokes its backing path and removes its link directory.
+Lease cleanup and owner exit remove all remaining link directories. The helper
+owns this state, so handing off a lease preserves named paths until the selected
+owner exits. Forced helper termination bypasses directory cleanup and can leave
+dangling links, while backing contents are revoked by descriptor closure on
+Linux or scope cleanup by the macOS volume manager. No orphan recovery is
+provided for link directories. Named paths retain the backend's access and
+canonicalization limitations.
+
+### Payloads and suffixes
+
 Payloads are limited to 64 MiB per request. Suffixes are limited to 80 ASCII
 letters, digits, dots, underscores, or hyphens. Allocation failures never fall
 back to ordinary temporary files.

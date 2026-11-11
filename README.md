@@ -66,6 +66,36 @@ fn main() -> io::Result<()> {
 Keep the lease alive for every read, including later reopens. A `LeasedFile`
 names a file but does not retain it.
 
+### Preserve a filename
+
+Use `filename` when a consumer needs an exact name, including on Linux:
+
+```rust,no_run
+use file_lease::{FileLease, FileOptions};
+
+fn main() -> file_lease::Result<()> {
+    let lease = FileLease::new(std::process::id());
+    let file = lease.materialize_with(
+        b"{\"token\":\"example\"}\n",
+        &FileOptions::new().filename("credentials.json"),
+    )?;
+    assert_eq!(file.path().file_name().unwrap(), "credentials.json");
+    Ok(())
+}
+```
+
+On Linux and macOS, this creates a symlink in a new private (`0700`) temporary
+directory. Only the directory and link metadata use the filesystem; payloads
+remain in the platform's memory-backed storage. Each allocation gets its own
+directory, so repeated names do not collide. `filename` accepts 1 to 255 ASCII
+letters, digits, dots, underscores, or hyphens, excluding `.` and `..`. It cannot
+be combined with `suffix`.
+
+The helper owns the directory: release, lease cleanup, or owner exit removes
+it, including after handoff. Killing the helper may leave a dangling link and
+directory, but revokes the contents. The link does not change the underlying
+backend's access requirements or support for programs that canonicalize paths.
+
 ## Control the lifetime
 
 Storage is allocated lazily on the first `materialize` call. The selected owner
@@ -91,7 +121,7 @@ file is created. A PID that has already exited and been reused would tie the
 lease to the unrelated process.
 
 Operations return `file_lease::Error`, whose `kind()` distinguishes invalid
-owners, suffixes and sizes, handed-off leases, helper and storage failures, and
+owners, filenames, suffixes and sizes, handed-off leases, helper and storage failures, and
 rejected releases or handoffs. It converts into `io::Error` for `?`.
 
 ### Replacing the launcher with the consumer

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Add `FileOptions::filename` to expose an exact filename through a symlink in
+  a private temporary directory on Linux and macOS. The helper cleans up links
+  on release or owner exit, including after handoff; payloads remain memory-backed.
+  Filename validation errors use `ErrorKind::InvalidFilename`. Rebuild the helper
+  with the library because the internal handshake has changed.
+
 - Always share macOS RAM volumes across overlapping leases and remove the
   `shared-volumes` feature. Builds that disabled default features to get
   separate volumes now share them; builds naming the feature must drop it.

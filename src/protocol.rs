@@ -8,6 +8,7 @@ pub(crate) const ALLOCATE: u8 = 1;
 pub(crate) const HANDOFF: u8 = 2;
 pub(crate) const CLOSE: u8 = 3;
 pub(crate) const RELEASE: u8 = 4;
+pub(crate) const ALLOCATE_NAMED: u8 = 5;
 pub(crate) const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_BYTES: usize = 16384;
 const MAX_SUFFIX_BYTES: usize = 80;
@@ -43,6 +44,32 @@ pub(crate) fn write_allocation(
     stream.write_all(&(bytes.len() as u64).to_le_bytes())?;
     write_string(stream, suffix)?;
     stream.write_all(bytes)
+}
+
+pub(crate) fn write_named_allocation(
+    stream: &mut impl Write,
+    bytes: &[u8],
+    filename: &str,
+) -> io::Result<()> {
+    crate::validate_filename(filename)?;
+    if bytes.len() as u64 > MAX_SECRET_BYTES {
+        return Err(tagged(
+            ErrorKind::TooLarge,
+            "Secret exceeds file lease size limit",
+        ));
+    }
+    stream.write_all(&[ALLOCATE_NAMED])?;
+    write_string(stream, filename)?;
+    // Reuse the allocation body without its opcode.
+    stream.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    write_string(stream, "")?;
+    stream.write_all(bytes)
+}
+
+pub(crate) fn read_filename(stream: &mut impl Read) -> io::Result<String> {
+    let filename = read_string(stream, 255)?;
+    crate::validate_filename(&filename)?;
+    Ok(filename)
 }
 
 /// Read the request body after the allocation opcode has been consumed.
@@ -308,6 +335,33 @@ mod tests {
             assert!(bytes.is_empty());
             assert_eq!(actual, suffix);
         }
+    }
+
+    #[test]
+    fn named_allocations_validate_before_writing_and_roundtrip() {
+        let mut frame = Vec::new();
+        write_named_allocation(&mut frame, b"key", "credentials.json").unwrap();
+        assert_eq!(frame[0], ALLOCATE_NAMED);
+        let mut incoming = &frame[1..];
+        assert_eq!(read_filename(&mut incoming).unwrap(), "credentials.json");
+        let (bytes, suffix) = read_allocation(&mut incoming).unwrap();
+        assert_eq!(&**bytes, b"key");
+        assert!(suffix.is_empty());
+        assert!(incoming.is_empty());
+
+        for filename in ["", ".", "..", "../escape", "a/b", "a\\b", &"a".repeat(256)] {
+            frame.clear();
+            assert!(write_named_allocation(&mut frame, b"key", filename).is_err());
+            assert!(frame.is_empty());
+            write_string(&mut frame, filename).unwrap();
+            assert!(read_filename(&mut &frame[..]).is_err());
+        }
+        frame.clear();
+        assert!(
+            write_named_allocation(&mut frame, &vec![0; MAX_SECRET_BYTES as usize + 1], "key")
+                .is_err()
+        );
+        assert!(frame.is_empty());
     }
 
     #[test]

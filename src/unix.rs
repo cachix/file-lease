@@ -1,32 +1,93 @@
 use super::helper::{self, above_stdio, reap_when_exited};
-use super::protocol::{self, ALLOCATE, CLOSE, HANDOFF, MAX_MESSAGE_BYTES, RELEASE};
+use super::protocol::{self, ALLOCATE, ALLOCATE_NAMED, CLOSE, HANDOFF, MAX_MESSAGE_BYTES, RELEASE};
 use super::*;
 use crate::error::{ErrorKind, tagged};
 use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::net::UnixStream,
+        unix::{fs::PermissionsExt, net::UnixStream},
     },
     process::{Child, Command},
 };
 
 #[cfg(target_os = "linux")]
-use super::linux::{Storage, watch_owner};
+use super::linux::{Storage as BackendStorage, watch_owner};
 #[cfg(target_os = "macos")]
 use super::macos::watch_owner;
 #[cfg(target_os = "macos")]
-use super::volume_pool::RemoteStorage as Storage;
+use super::volume_pool::RemoteStorage as BackendStorage;
 
 const SOCKET_ENV: &str = "_FILE_LEASE_KEEPER_SOCKET";
 const OWNER_ENV: &str = "_FILE_LEASE_KEEPER_OWNER";
-// Version 4 adds the build identity to the handshake. Reject older helpers
-// before sending payloads rather than accepting an unknown storage contract.
+// Named allocations require a helper that understands the new opcode.
 #[cfg(not(target_os = "macos"))]
-const READY: &[u8; 4] = b"SFL4";
+const READY: &[u8; 4] = b"SFL6";
 #[cfg(target_os = "macos")]
 // macOS helpers require a separate inherited channel to the volume pool.
-const READY: &[u8; 4] = b"SFL5";
+const READY: &[u8; 4] = b"SFL7";
+
+// Lives in the helper so named paths follow the selected owner after handoff.
+struct Storage {
+    backend: BackendStorage,
+    links: std::collections::HashMap<PathBuf, (PathBuf, tempfile::TempDir)>,
+    next_link: u64,
+}
+
+impl Storage {
+    fn materialize(
+        &mut self,
+        bytes: &[u8],
+        suffix: &str,
+        filename: Option<&str>,
+    ) -> io::Result<PathBuf> {
+        let Some(filename) = filename else {
+            return self.backend.materialize(bytes, suffix);
+        };
+        crate::validate_filename(filename)?;
+        // Never reuse a released link path within this helper, even if the
+        // temporary directory generator repeats its random suffix.
+        let id = self.next_link;
+        self.next_link = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("File lease filename space exhausted"))?;
+        // Canonicalize only the directory: resolving a Linux memfd target
+        // would produce its deleted backing name rather than an openable path.
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("file-lease-{}-{id}-", std::process::id()))
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let path = directory.path().canonicalize()?.join(filename);
+        let target = self.backend.materialize(bytes, suffix)?;
+        if let Err(error) = std::os::unix::fs::symlink(&target, &path) {
+            self.backend.release(&target)?;
+            return Err(error);
+        }
+        self.links.insert(path.clone(), (target, directory));
+        Ok(path)
+    }
+
+    fn release(&mut self, path: &Path) -> io::Result<()> {
+        if let Some((target, _)) = self.links.get(path) {
+            self.backend.release(target)?;
+            let (_, directory) = self.links.remove(path).unwrap();
+            directory.close()
+        } else {
+            self.backend.release(path)
+        }
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        let result = self.backend.cleanup();
+        let mut link_result = Ok(());
+        for (_, (_, directory)) in self.links.drain() {
+            if let Err(error) = directory.close() {
+                link_result = Err(error);
+            }
+        }
+        result.and(link_result)
+    }
+}
 
 // FileLease owns this behind its shared mutex. Mutable access serializes the
 // request stream, handoff state, and child lifecycle together.
@@ -141,7 +202,12 @@ impl Keeper {
         })
     }
 
-    pub(super) fn materialize(&mut self, bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
+    pub(super) fn materialize(
+        &mut self,
+        bytes: &[u8],
+        suffix: &str,
+        filename: Option<&str>,
+    ) -> io::Result<PathBuf> {
         let _span = super::profiling::Span::new("lease.allocate");
         let stream = &mut self.stream;
         if self.handed_off {
@@ -150,7 +216,11 @@ impl Keeper {
                 "File lease has been handed off",
             ));
         }
-        protocol::write_allocation(stream, bytes, suffix)?;
+        if let Some(filename) = filename {
+            protocol::write_named_allocation(stream, bytes, filename)?;
+        } else {
+            protocol::write_allocation(stream, bytes, suffix)?;
+        }
         let path = protocol::KEEPER_REPLY.read(stream)?.map_err(|message| {
             tagged(
                 ErrorKind::Storage,
@@ -269,9 +339,14 @@ fn run_keeper(socket: &str) -> io::Result<()> {
     };
     helper::disable_core_dumps()?;
     #[cfg(target_os = "macos")]
-    let storage = Storage::from_env()?;
+    let backend = BackendStorage::from_env()?;
     #[cfg(not(target_os = "macos"))]
-    let storage = Storage::default();
+    let backend = BackendStorage::default();
+    let storage = Storage {
+        backend,
+        links: Default::default(),
+        next_link: 0,
+    };
     let storage = Arc::new(Mutex::new(storage));
     let mut owner_watch = OwnerWatch::start(owner, storage.clone())?;
     helper::write_ready(&mut stream, READY)?;
@@ -291,15 +366,20 @@ fn run_keeper(socket: &str) -> io::Result<()> {
             result => result?,
         }
         match op[0] {
-            ALLOCATE => {
+            ALLOCATE | ALLOCATE_NAMED => {
                 if handed_off {
                     return Err(io::Error::other("Cannot allocate after file lease handoff"));
                 }
+                let filename = if op[0] == ALLOCATE_NAMED {
+                    Some(protocol::read_filename(&mut stream)?)
+                } else {
+                    None
+                };
                 let (bytes, suffix) = protocol::read_allocation(&mut stream)?;
                 let path = storage
                     .lock()
                     .map_err(|_| io::Error::other("Storage lock poisoned"))?
-                    .materialize(&bytes, &suffix);
+                    .materialize(&bytes, &suffix, filename.as_deref());
                 match path {
                     Ok(path) => {
                         let path = path

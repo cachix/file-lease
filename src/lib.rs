@@ -91,6 +91,7 @@ impl AsRef<OsStr> for LeasedFile {
 #[derive(Clone, Debug, Default)]
 pub struct FileOptions {
     suffix: Option<String>,
+    filename: Option<String>,
 }
 
 impl FileOptions {
@@ -103,6 +104,19 @@ impl FileOptions {
     /// Linux omits it. See [`ErrorKind::InvalidSuffix`] for accepted values.
     pub fn suffix(mut self, suffix: impl Into<String>) -> Self {
         self.suffix = Some(suffix.into());
+        self
+    }
+
+    /// Expose the file through a symlink with this exact filename in a new
+    /// private temporary directory. Works on Linux and macOS. The contents
+    /// remain memory-backed; only the link and directory use the filesystem.
+    ///
+    /// Names accept 1 to 255 ASCII letters, digits, dots, underscores, or
+    /// hyphens, except `.` and `..`. Cannot be combined with [`Self::suffix`].
+    /// The helper removes the directory on release or lease cleanup, including
+    /// after handoff. Killing the helper may leave a dangling link behind.
+    pub fn filename(mut self, filename: impl Into<String>) -> Self {
+        self.filename = Some(filename.into());
         self
     }
 }
@@ -132,6 +146,19 @@ impl FileLease {
 
     /// Store `bytes` in a new read-only, memory-backed file with `options`.
     pub fn materialize_with(&self, bytes: &[u8], options: &FileOptions) -> Result<LeasedFile> {
+        if let Some(filename) = options.filename.as_deref() {
+            if options.suffix.is_some() {
+                return Err(Error::from_io(
+                    tagged(
+                        ErrorKind::InvalidFilename,
+                        "Filename and suffix cannot be combined",
+                    ),
+                    ErrorKind::InvalidFilename,
+                ));
+            }
+            validate_filename(filename)
+                .map_err(|error| Error::from_io(error, ErrorKind::InvalidFilename))?;
+        }
         let mut keeper = self.lock()?;
         if keeper.is_none() {
             *keeper = Some(
@@ -142,7 +169,11 @@ impl FileLease {
         let path = keeper
             .as_mut()
             .unwrap()
-            .materialize(bytes, options.suffix.as_deref().unwrap_or(""))
+            .materialize(
+                bytes,
+                options.suffix.as_deref().unwrap_or(""),
+                options.filename.as_deref(),
+            )
             .map_err(|error| Error::from_io(error, ErrorKind::Io))?;
         Ok(LeasedFile { path })
     }
@@ -184,6 +215,22 @@ impl FileLease {
     }
 }
 
+fn validate_filename(filename: &str) -> io::Result<()> {
+    if filename.is_empty()
+        || filename.len() > 255
+        || matches!(filename, "." | "..")
+        || !filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(tagged(
+            ErrorKind::InvalidFilename,
+            "Invalid file lease filename",
+        ));
+    }
+    Ok(())
+}
+
 /// Run the internal helper if this process was started as one.
 ///
 /// Returns `None` for ordinary invocations. Call this before application
@@ -205,7 +252,12 @@ mod platform {
                 "Process-owned file delivery requires Linux or macOS",
             ))
         }
-        pub(super) fn materialize(&mut self, _: &[u8], _: &str) -> io::Result<PathBuf> {
+        pub(super) fn materialize(
+            &mut self,
+            _: &[u8],
+            _: &str,
+            _: Option<&str>,
+        ) -> io::Result<PathBuf> {
             unreachable!()
         }
         pub(super) fn handoff_to(&mut self, _: Option<u32>) -> io::Result<()> {
@@ -290,6 +342,116 @@ mod tests {
             "secret survived its lease: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn named_files_preserve_names_and_have_independent_private_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lease = FileLease::new(std::process::id());
+        let options = FileOptions::new().filename("credentials.json");
+        let first = lease.materialize_with(b"first", &options).unwrap();
+        let second = lease.materialize_with(b"second", &options).unwrap();
+        assert_eq!(first.path().file_name().unwrap(), "credentials.json");
+        assert_ne!(first.path().parent(), second.path().parent());
+        assert!(first.path().is_absolute());
+        assert!(first.path().is_symlink());
+        assert_eq!(
+            std::fs::metadata(first.path().parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let target = std::fs::read_link(&first).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        let clone = lease.clone();
+        drop(lease);
+        clone.release(&first).unwrap();
+        assert!(!first.path().parent().unwrap().exists());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        let third = clone.materialize_with(b"third", &options).unwrap();
+        assert_ne!(first, third);
+        drop(clone);
+        assert!(!second.path().parent().unwrap().exists());
+        assert!(!third.path().parent().unwrap().exists());
+    }
+
+    #[test]
+    fn named_files_follow_handoff_and_remove_links_on_owner_exit() {
+        let mut owner = Command::new("sleep").arg("60").spawn().unwrap();
+        let lease = FileLease::new(std::process::id());
+        let file = lease
+            .materialize_with(b"handed off", &FileOptions::new().filename("config.toml"))
+            .unwrap();
+        lease.handoff_to(owner.id()).unwrap();
+        drop(lease);
+        assert_eq!(std::fs::read(&file).unwrap(), b"handed off");
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        let directory = file.path().parent().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while directory.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn invalid_filenames_fail_before_starting_a_helper() {
+        let lease = FileLease::new(std::process::id());
+        for filename in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "é",
+            &"a".repeat(256),
+        ] {
+            let error = lease
+                .materialize_with(b"payload", &FileOptions::new().filename(filename))
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidFilename, "{filename:?}");
+            assert!(lease.keeper.lock().unwrap().is_none());
+            assert_eq!(io::Error::from(error).kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            lease
+                .materialize_with(
+                    b"payload",
+                    &FileOptions::new().filename("key.pem").suffix(".pem")
+                )
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidFilename
+        );
+        let file = lease
+            .materialize_with(b"valid", &FileOptions::new().filename("a".repeat(255)))
+            .unwrap();
+        assert_eq!(std::fs::read(file).unwrap(), b"valid");
+    }
+
+    #[test]
+    fn helper_crash_revokes_named_file_contents() {
+        let lease = FileLease::new(std::process::id());
+        let file = lease
+            .materialize_with(b"crash fixture", &FileOptions::new().filename("secret.pem"))
+            .unwrap();
+        let pid = lease.keeper.lock().unwrap().as_ref().unwrap().pid();
+        assert_eq!(unsafe { libc::kill(pid as _, libc::SIGKILL) }, 0);
+        drop(lease);
+        revoked(file.path());
+        // SIGKILL bypasses the helper's directory cleanup. Only metadata remains.
+        assert!(file.path().is_symlink());
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(file.path().parent().unwrap()).unwrap();
     }
 
     #[test]

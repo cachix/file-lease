@@ -19,6 +19,10 @@ pub enum ErrorKind {
     /// The suffix is longer than 80 bytes or contains characters other than
     /// ASCII letters, digits, `.`, `_`, or `-`.
     InvalidSuffix,
+    /// The filename is empty, `.` or `..`, longer than 255 bytes, contains
+    /// characters other than ASCII letters, digits, `.`, `_`, or `-`, or was
+    /// combined with a suffix.
+    InvalidFilename,
     /// The payload exceeds the 64 MiB request limit.
     TooLarge,
     /// The lease was handed off and cannot allocate more files.
@@ -98,9 +102,10 @@ impl error::Error for Tag {}
 pub(crate) fn tagged(kind: ErrorKind, message: impl Into<String>) -> io::Error {
     let io_kind = match kind {
         ErrorKind::Unsupported => io::ErrorKind::Unsupported,
-        ErrorKind::InvalidOwner | ErrorKind::InvalidSuffix | ErrorKind::TooLarge => {
-            io::ErrorKind::InvalidInput
-        }
+        ErrorKind::InvalidOwner
+        | ErrorKind::InvalidSuffix
+        | ErrorKind::InvalidFilename
+        | ErrorKind::TooLarge => io::ErrorKind::InvalidInput,
         _ => io::ErrorKind::Other,
     };
     io::Error::new(
