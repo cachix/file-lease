@@ -26,16 +26,16 @@ Requires Rust 1.92 or newer. Add the library to your application:
 
 ```toml
 [dependencies]
-file-lease = "0.1"
+file-lease = "0.2"
 ```
 
 Install the matching helper executable:
 
 ```sh
-cargo install file-lease --version 0.1.0 --locked
+cargo install file-lease --version 0.2.0 --locked
 ```
 
-Use the same version and feature configuration for the library and helper.
+Use the same version for the library and helper.
 You can also [embed the helper in your application](#helper-deployment).
 To build the helper from a checkout, run `cargo install --path . --locked`
 from the repository root and use that checkout as a path dependency.
@@ -180,7 +180,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-Library and helper versions and feature configurations must match. The helper
+Library and helper versions must match. The helper
 reports its build at startup, and a mismatch fails with `ErrorKind::Helper`
 before any payload is sent. The wire protocol and recovery format are internal.
 Helper readiness has a ten-second deadline; a helper that does not complete

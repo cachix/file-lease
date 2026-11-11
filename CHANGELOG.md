@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
+### Upgrading from 0.1
+
+- Update the library dependency to `file-lease = "0.2"` and install the matching
+  helper with `cargo install file-lease --version 0.2.0 --locked`.
+- Remove `shared-volumes` from dependency feature lists. macOS volumes are now
+  always shared across overlapping leases, including with default features disabled.
+- Upgrade the library and helper together; older helpers are rejected before
+  any payload is sent.
+
+### Changes
+
 - Add `FileOptions::filename` to expose an exact filename through a symlink in
   a private temporary directory on Linux and macOS. The helper cleans up links
   on release or owner exit, including after handoff; payloads remain memory-backed.
